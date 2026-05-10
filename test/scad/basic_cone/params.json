@@ -2,12 +2,14 @@
   "combinations": [
     {
       "height": 8,
-      "radius": 3,
+      "radius_bottom": 3,
+      "radius_top": 3,
       "centered": true
     },
     {
       "height": 6,
-      "radius": 4,
+      "radius_bottom": 2.5,
+      "radius_top": 1.5,
       "centered": false
     }
   ]
