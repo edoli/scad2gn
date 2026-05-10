@@ -47,6 +47,8 @@ def main() -> int:
             blender_output = Path(args.blender_output_root) / case_directory.name / f"{slug}.stl"
             openscad_output.parent.mkdir(parents=True, exist_ok=True)
             blender_output.parent.mkdir(parents=True, exist_ok=True)
+            if blender_output.exists():
+                blender_output.unlink()
 
             openscad_command = [args.openscad, "-o", str(openscad_output)]
             for key, value in combination.items():
@@ -73,9 +75,10 @@ def main() -> int:
                 json.dumps(combination, sort_keys=True),
             ]
             blender_run = subprocess.run(blender_command, capture_output=True, text=True)
-            if blender_run.returncode != 0 or not blender_output.exists():
+            blender_log = f"{blender_run.stdout}{blender_run.stderr}"
+            if blender_run.returncode != 0 or not blender_output.exists() or "Traceback (most recent call last)" in blender_log:
                 raise SystemExit(
-                    f"Blender export failed for {model_path} ({slug})\n{blender_run.stdout}{blender_run.stderr}"
+                    f"Blender export failed for {model_path} ({slug})\n{blender_log}"
                 )
 
             comparison = compare_stl_meshes(openscad_output, blender_output)

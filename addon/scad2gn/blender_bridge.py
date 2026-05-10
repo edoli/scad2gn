@@ -703,22 +703,32 @@ class _GeometryNodesBuilder:
     def _build_boolean(self, node: BooleanNode, x: float, y: float):
         if not node.children:
             raise BlenderConversionError(f"Boolean node {node.kind}() has no children")
-        current_socket = self.build_geometry(node.children[0], x - 420, y)
-        current_y = y
         operation_map = {
             "union": "UNION",
             "difference": "DIFFERENCE",
             "intersection": "INTERSECT",
         }
+
+        if node.kind in {"union", "intersection"}:
+            boolean_node = self.group.nodes.new("GeometryNodeMeshBoolean")
+            boolean_node.location = (x, y)
+            boolean_node.operation = operation_map[node.kind]
+            boolean_node.solver = "MANIFOLD"
+            for index, child in enumerate(node.children):
+                child_socket = self.build_geometry(child, x - 420, y - (index * 240))
+                self.group.links.new(child_socket, boolean_node.inputs[1])
+            return boolean_node.outputs[0]
+
+        current_socket = self.build_geometry(node.children[0], x - 420, y)
         for index, child in enumerate(node.children[1:], start=1):
             other_socket = self.build_geometry(child, x - 420, y - (index * 240))
             boolean_node = self.group.nodes.new("GeometryNodeMeshBoolean")
-            boolean_node.location = (x + (index * 220), current_y - (index * 120))
+            boolean_node.location = (x + (index * 220), y - (index * 120))
             boolean_node.operation = operation_map[node.kind]
             boolean_node.solver = "MANIFOLD"
-            self.group.links.new(current_socket, boolean_node.inputs["Mesh 1"])
-            self.group.links.new(other_socket, boolean_node.inputs["Mesh 2"])
-            current_socket = boolean_node.outputs["Mesh"]
+            self.group.links.new(current_socket, boolean_node.inputs[0])
+            self.group.links.new(other_socket, boolean_node.inputs[1])
+            current_socket = boolean_node.outputs[0]
         return current_socket
 
     def _build_extrude(self, node: ExtrudeNode, x: float, y: float):
