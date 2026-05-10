@@ -29,6 +29,20 @@ class Profile2D:
         return Profile2D(points=transformed)
 
 
+@dataclass(slots=True)
+class Bounds3D:
+    min_corner: Vector
+    max_corner: Vector
+
+    @property
+    def center(self) -> Vector:
+        return (self.min_corner + self.max_corner) / 2.0
+
+    @property
+    def size(self) -> Vector:
+        return self.max_corner - self.min_corner
+
+
 def clear_scene() -> None:
     bpy.ops.object.select_all(action="SELECT")
     bpy.ops.object.delete()
@@ -47,18 +61,12 @@ def create_scad_object(scad_path: str, parameters: dict | None = None, object_na
     if ir is None:
         raise BlenderConversionError(f"No geometry generated for {source_path}")
 
-    source_object = _compile_3d(ir, source_path.stem)
-    _bake_object_transform(source_object)
-    source_object.hide_set(True)
-    source_object.hide_render = True
-    source_object.name = f"{source_path.stem}_Source"
-
-    wrapper = _create_wrapper_object(source_object, object_name or source_path.stem)
+    wrapper = _create_wrapper_object(ir, object_name or source_path.stem)
     defaults = collect_top_level_defaults(source_path)
     wrapper["scad_source_path"] = str(source_path)
     wrapper["scad_params_json"] = json.dumps(params, sort_keys=True)
     wrapper["scad_defaults_json"] = json.dumps(defaults, sort_keys=True)
-    wrapper["scad_generated_source"] = source_object.name
+    wrapper["scad_generated_kind"] = "native_geometry_nodes"
     wrapper["scad_last_error"] = ""
     return wrapper
 
@@ -73,19 +81,24 @@ def rebuild_scad_object(wrapper_object, parameters: dict | None = None):
         raw_params = wrapper_object.get("scad_params_json", "{}")
         params = json.loads(raw_params)
 
-    old_source_name = wrapper_object.get("scad_generated_source")
-    old_source = bpy.data.objects.get(old_source_name) if old_source_name else None
+    ir = load_ir_from_file(source_path, params)
+    if ir is None:
+        raise BlenderConversionError(f"No geometry generated for {source_path}")
 
-    new_wrapper = create_scad_object(source_path, params, object_name=wrapper_object.name)
-    wrapper_object["scad_params_json"] = new_wrapper["scad_params_json"]
-    wrapper_object["scad_defaults_json"] = new_wrapper["scad_defaults_json"]
-    wrapper_object["scad_generated_source"] = new_wrapper["scad_generated_source"]
+    defaults = collect_top_level_defaults(source_path)
+    _cleanup_helper_objects(wrapper_object.name)
+    new_group = _build_wrapper_node_group(wrapper_object.name, ir)
+    modifier = _ensure_nodes_modifier(wrapper_object)
+    old_group = modifier.node_group
+    modifier.node_group = new_group
+
+    wrapper_object["scad_params_json"] = json.dumps(params, sort_keys=True)
+    wrapper_object["scad_defaults_json"] = json.dumps(defaults, sort_keys=True)
+    wrapper_object["scad_generated_kind"] = "native_geometry_nodes"
     wrapper_object["scad_last_error"] = ""
-    _update_wrapper_node_group(wrapper_object, bpy.data.objects[new_wrapper["scad_generated_source"]])
-
-    bpy.data.objects.remove(new_wrapper, do_unlink=True)
-    if old_source is not None and old_source.name != wrapper_object["scad_generated_source"]:
-        bpy.data.objects.remove(old_source, do_unlink=True)
+    _cleanup_legacy_generated_source(wrapper_object)
+    if old_group is not None and old_group != new_group and old_group.users == 0:
+        bpy.data.node_groups.remove(old_group)
     return wrapper_object
 
 
@@ -537,38 +550,283 @@ def _link_mesh_object(name: str, mesh):
     return obj
 
 
-def _create_wrapper_object(source_object, display_name: str):
+def _create_wrapper_object(ir: IRNode, display_name: str):
     collection = _ensure_generated_collection()
-    mesh = bpy.data.meshes.new(f"{display_name}_WrapperMesh")
+    mesh = bpy.data.meshes.new(f"{display_name}_HostMesh")
     wrapper = bpy.data.objects.new(display_name, mesh)
     collection.objects.link(wrapper)
-    node_group = _build_wrapper_node_group(display_name, source_object)
-    modifier = wrapper.modifiers.new(name="SCAD2GN", type="NODES")
+    node_group = _build_wrapper_node_group(display_name, ir)
+    modifier = _ensure_nodes_modifier(wrapper)
     modifier.node_group = node_group
     return wrapper
 
 
-def _build_wrapper_node_group(display_name: str, source_object):
+def _build_wrapper_node_group(display_name: str, ir: IRNode):
     group = bpy.data.node_groups.new(f"{display_name}_GN", "GeometryNodeTree")
     group.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
     output = group.nodes.new("NodeGroupOutput")
-    object_info = group.nodes.new("GeometryNodeObjectInfo")
-    object_info.transform_space = "RELATIVE"
-    object_info.inputs["Object"].default_value = source_object
-    output.location = (250, 0)
-    group.links.new(object_info.outputs["Geometry"], output.inputs["Geometry"])
+    output.location = (1200, 0)
+    builder = _GeometryNodesBuilder(group, display_name)
+    geometry_socket = builder.build_geometry(ir, 0, 0)
+    group.links.new(geometry_socket, output.inputs["Geometry"])
     return group
 
 
-def _update_wrapper_node_group(wrapper_object, source_object) -> None:
+def _ensure_nodes_modifier(wrapper_object):
     modifier = next((modifier for modifier in wrapper_object.modifiers if modifier.type == "NODES"), None)
-    if modifier is None or modifier.node_group is None:
-        raise BlenderConversionError("Wrapper object does not have a Geometry Nodes modifier")
-    group = modifier.node_group
-    object_info = next((node for node in group.nodes if node.bl_idname == "GeometryNodeObjectInfo"), None)
-    if object_info is None:
-        raise BlenderConversionError("Wrapper Geometry Nodes group is missing Object Info")
-    object_info.inputs["Object"].default_value = source_object
+    if modifier is None:
+        modifier = wrapper_object.modifiers.new(name="SCAD2GN", type="NODES")
+    return modifier
+
+
+def _cleanup_legacy_generated_source(wrapper_object) -> None:
+    _cleanup_helper_objects(wrapper_object.name)
+    old_source_name = wrapper_object.get("scad_generated_source")
+    if old_source_name:
+        old_source = bpy.data.objects.get(old_source_name)
+        if old_source is not None:
+            bpy.data.objects.remove(old_source, do_unlink=True)
+        del wrapper_object["scad_generated_source"]
+
+
+def _cleanup_helper_objects(owner_name: str) -> None:
+    for obj in list(bpy.data.objects):
+        if obj.get("scad_helper_owner") == owner_name:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+
+class _GeometryNodesBuilder:
+    def __init__(self, group, owner_name: str) -> None:
+        self.group = group
+        self.owner_name = owner_name
+
+    def build_geometry(self, node: IRNode, x: float, y: float):
+        if isinstance(node, PrimitiveNode):
+            return self._build_primitive(node, x, y)
+
+        if isinstance(node, TransformNode):
+            if _node_dimension(node.child) == 2:
+                raise BlenderConversionError(f"2D transform {node.kind}() must be consumed by an extrusion node")
+            child_socket = self.build_geometry(node.child, x - 220, y)
+            child_bounds = _measure_ir_bounds(node.child)
+            return self._build_transform(node, child_socket, child_bounds, x, y)
+
+        if isinstance(node, BooleanNode):
+            return self._build_boolean(node, x, y)
+
+        if isinstance(node, ExtrudeNode):
+            return self._build_extrude(node, x, y)
+
+        raise BlenderConversionError(f"Unsupported IR node for Geometry Nodes: {type(node).__name__}")
+
+    def _build_primitive(self, node: PrimitiveNode, x: float, y: float):
+        if node.kind == "cube":
+            primitive = self.group.nodes.new("GeometryNodeMeshCube")
+            primitive.location = (x, y)
+            size = _vector3(node.params.get("size", node.params.get("_positional", [1.0])[0] if node.params.get("_positional") else 1.0))
+            primitive.inputs["Size"].default_value = size
+            primitive.inputs["Vertices X"].default_value = 2
+            primitive.inputs["Vertices Y"].default_value = 2
+            primitive.inputs["Vertices Z"].default_value = 2
+            geometry = primitive.outputs["Mesh"]
+            if not bool(node.params.get("center", False)):
+                geometry = self._add_transform(
+                    geometry,
+                    Vector((size[0] / 2.0, size[1] / 2.0, size[2] / 2.0)),
+                    Euler((0.0, 0.0, 0.0)),
+                    Vector((1.0, 1.0, 1.0)),
+                    x + 220,
+                    y,
+                )
+            return geometry
+
+        if node.kind == "sphere":
+            primitive = self.group.nodes.new("GeometryNodeMeshUVSphere")
+            primitive.location = (x, y)
+            radius = _resolve_sphere_radius(node.params)
+            tessellation = node.params.get("_tessellation", {})
+            segments = _sphere_segment_count(radius, tessellation)
+            primitive.inputs["Segments"].default_value = max(3, segments)
+            primitive.inputs["Rings"].default_value = max(2, segments // 2)
+            primitive.inputs["Radius"].default_value = radius
+            return primitive.outputs["Mesh"]
+
+        if node.kind == "cylinder":
+            primitive = self.group.nodes.new("GeometryNodeMeshCone")
+            primitive.location = (x, y)
+            height = float(node.params.get("h", node.params.get("_positional", [1.0])[0] if node.params.get("_positional") else 1.0))
+            radius_bottom = _resolve_radius(node.params, "r", "d", "r1", "d1", fallback=1.0)
+            radius_top = _resolve_radius(node.params, "r", "d", "r2", "d2", fallback=radius_bottom)
+            tessellation = node.params.get("_tessellation", {})
+            segments = _segment_count(max(radius_bottom, radius_top), tessellation)
+            primitive.inputs["Vertices"].default_value = max(8, segments)
+            primitive.inputs["Side Segments"].default_value = 1
+            primitive.inputs["Fill Segments"].default_value = 1
+            primitive.inputs["Radius Top"].default_value = radius_top
+            primitive.inputs["Radius Bottom"].default_value = radius_bottom
+            primitive.inputs["Depth"].default_value = height
+            primitive.fill_type = "NGON"
+            geometry = primitive.outputs["Mesh"]
+            if bool(node.params.get("center", False)):
+                geometry = self._add_transform(
+                    geometry,
+                    Vector((0.0, 0.0, -height / 2.0)),
+                    Euler((0.0, 0.0, 0.0)),
+                    Vector((1.0, 1.0, 1.0)),
+                    x + 220,
+                    y,
+                )
+            return geometry
+
+        raise BlenderConversionError(f"Unsupported 3D primitive for Geometry Nodes: {node.kind}")
+
+    def _build_transform(
+        self,
+        node: TransformNode,
+        child_socket,
+        child_bounds: Bounds3D,
+        x: float,
+        y: float,
+    ):
+        translation, rotation, scale = _transform_components(node, child_bounds)
+        return self._add_transform(child_socket, translation, rotation, scale, x, y)
+
+    def _add_transform(self, geometry_socket, translation: Vector, rotation: Euler, scale: Vector, x: float, y: float):
+        transform = self.group.nodes.new("GeometryNodeTransform")
+        transform.location = (x, y)
+        self.group.links.new(geometry_socket, transform.inputs["Geometry"])
+        transform.inputs["Translation"].default_value = translation
+        transform.inputs["Rotation"].default_value = rotation
+        transform.inputs["Scale"].default_value = scale
+        return transform.outputs["Geometry"]
+
+    def _build_boolean(self, node: BooleanNode, x: float, y: float):
+        if not node.children:
+            raise BlenderConversionError(f"Boolean node {node.kind}() has no children")
+        current_socket = self.build_geometry(node.children[0], x - 420, y)
+        current_y = y
+        operation_map = {
+            "union": "UNION",
+            "difference": "DIFFERENCE",
+            "intersection": "INTERSECT",
+        }
+        for index, child in enumerate(node.children[1:], start=1):
+            other_socket = self.build_geometry(child, x - 420, y - (index * 240))
+            boolean_node = self.group.nodes.new("GeometryNodeMeshBoolean")
+            boolean_node.location = (x + (index * 220), current_y - (index * 120))
+            boolean_node.operation = operation_map[node.kind]
+            boolean_node.solver = "MANIFOLD"
+            self.group.links.new(current_socket, boolean_node.inputs["Mesh 1"])
+            self.group.links.new(other_socket, boolean_node.inputs["Mesh 2"])
+            current_socket = boolean_node.outputs["Mesh"]
+        return current_socket
+
+    def _build_extrude(self, node: ExtrudeNode, x: float, y: float):
+        profile = _compile_2d(node.child)
+        if node.kind == "linear_extrude":
+            return self._build_linear_extrude(profile, node.params, x, y)
+        if node.kind == "rotate_extrude":
+            return self._build_rotate_extrude(profile, node.params, x, y)
+        raise BlenderConversionError(f"Unsupported extrusion for Geometry Nodes: {node.kind}")
+
+    def _build_linear_extrude(self, profile: Profile2D, params: dict, x: float, y: float):
+        curve_socket = self._build_profile_curve(profile.points, x - 480, y)
+        height = float(params.get("height", params.get("_positional", [1.0])[0] if params.get("_positional") else 1.0))
+        path_line = self.group.nodes.new("GeometryNodeCurvePrimitiveLine")
+        path_line.location = (x - 240, y + 160)
+        path_line.inputs["Start"].default_value = (0.0, 0.0, 0.0)
+        path_line.inputs["End"].default_value = (0.0, 0.0, height)
+
+        curve_to_mesh = self.group.nodes.new("GeometryNodeCurveToMesh")
+        curve_to_mesh.location = (x, y)
+        self.group.links.new(path_line.outputs["Curve"], curve_to_mesh.inputs["Curve"])
+        self.group.links.new(curve_socket, curve_to_mesh.inputs["Profile Curve"])
+        curve_to_mesh.inputs["Fill Caps"].default_value = True
+        geometry = curve_to_mesh.outputs["Mesh"]
+
+        if bool(params.get("center", False)):
+            geometry = self._add_transform(
+                geometry,
+                Vector((0.0, 0.0, -height / 2.0)),
+                Euler((0.0, 0.0, 0.0)),
+                Vector((1.0, 1.0, 1.0)),
+                x + 220,
+                y,
+            )
+        return geometry
+
+    def _build_rotate_extrude(self, profile: Profile2D, params: dict, x: float, y: float):
+        angle = float(params.get("angle", 360.0))
+        if not math.isclose(angle, 360.0):
+            raise BlenderConversionError("rotate_extrude(angle != 360) is not supported in the Blender 5.1 GN path yet")
+
+        min_radius = min(point[0] for point in profile.points)
+        if min_radius <= 0.0:
+            raise BlenderConversionError("rotate_extrude() requires profile points with positive X radius in the GN path")
+
+        tessellation = params.get("_tessellation", {})
+        step_count = max(8, _segment_count(max(point[0] for point in profile.points), tessellation))
+
+        shifted_points = [(point[0] - min_radius, point[1]) for point in profile.points]
+        profile_socket = self._build_profile_curve(shifted_points, x - 680, y - 180)
+
+        path_circle = self.group.nodes.new("GeometryNodeMeshCircle")
+        path_circle.location = (x - 680, y + 140)
+        path_circle.inputs["Vertices"].default_value = step_count
+        path_circle.inputs["Radius"].default_value = min_radius
+
+        path_curve = self.group.nodes.new("GeometryNodeMeshToCurve")
+        path_curve.location = (x - 460, y + 140)
+        self.group.links.new(path_circle.outputs["Mesh"], path_curve.inputs["Mesh"])
+
+        curve_to_mesh = self.group.nodes.new("GeometryNodeCurveToMesh")
+        curve_to_mesh.location = (x - 180, y)
+        self.group.links.new(path_curve.outputs["Curve"], curve_to_mesh.inputs["Curve"])
+        self.group.links.new(profile_socket, curve_to_mesh.inputs["Profile Curve"])
+        curve_to_mesh.inputs["Fill Caps"].default_value = True
+        return curve_to_mesh.outputs["Mesh"]
+
+    def _build_profile_curve(self, points: list[tuple[float, float]], x: float, y: float):
+        if len(points) < 3:
+            raise BlenderConversionError("A profile curve requires at least three points")
+
+        points_node = self.group.nodes.new("GeometryNodePoints")
+        points_node.location = (x, y)
+        points_node.inputs["Count"].default_value = len(points)
+        points_node.inputs["Radius"].default_value = 0.001
+
+        index_node = self.group.nodes.new("GeometryNodeInputIndex")
+        index_node.location = (x, y - 220)
+
+        index_switch = self.group.nodes.new("GeometryNodeIndexSwitch")
+        index_switch.location = (x + 220, y - 220)
+        index_switch.data_type = "VECTOR"
+        while len(index_switch.index_switch_items) < len(points):
+            index_switch.index_switch_items.new()
+        self.group.links.new(index_node.outputs["Index"], index_switch.inputs["Index"])
+        for point_index, point in enumerate(points):
+            index_switch.inputs[str(point_index)].default_value = (float(point[0]), float(point[1]), 0.0)
+
+        set_position = self.group.nodes.new("GeometryNodeSetPosition")
+        set_position.location = (x + 440, y)
+        self.group.links.new(points_node.outputs["Points"], set_position.inputs["Geometry"])
+        self.group.links.new(index_switch.outputs["Output"], set_position.inputs["Position"])
+
+        points_to_curves = self.group.nodes.new("GeometryNodePointsToCurves")
+        points_to_curves.location = (x + 660, y)
+        self.group.links.new(set_position.outputs["Geometry"], points_to_curves.inputs["Points"])
+        self.group.links.new(index_node.outputs["Index"], points_to_curves.inputs["Weight"])
+
+        spline_type = self.group.nodes.new("GeometryNodeCurveSplineType")
+        spline_type.location = (x + 880, y)
+        spline_type.spline_type = "POLY"
+        self.group.links.new(points_to_curves.outputs["Curves"], spline_type.inputs["Curve"])
+
+        cyclic = self.group.nodes.new("GeometryNodeSetSplineCyclic")
+        cyclic.location = (x + 1100, y)
+        cyclic.inputs["Cyclic"].default_value = True
+        self.group.links.new(spline_type.outputs["Curve"], cyclic.inputs["Curve"])
+        return cyclic.outputs["Curve"]
 
 
 def _ensure_generated_collection():
@@ -577,6 +835,196 @@ def _ensure_generated_collection():
         collection = bpy.data.collections.new(GENERATED_COLLECTION_NAME)
         bpy.context.scene.collection.children.link(collection)
     return collection
+
+
+def _measure_ir_bounds(node: IRNode) -> Bounds3D:
+    if isinstance(node, PrimitiveNode):
+        if node.kind == "cube":
+            size = _vector3(node.params.get("size", node.params.get("_positional", [1.0])[0] if node.params.get("_positional") else 1.0))
+            center = bool(node.params.get("center", False))
+            min_corner = Vector((-size[0] / 2.0, -size[1] / 2.0, -size[2] / 2.0)) if center else Vector((0.0, 0.0, 0.0))
+            max_corner = Vector((size[0] / 2.0, size[1] / 2.0, size[2] / 2.0)) if center else Vector(size)
+            return Bounds3D(min_corner, max_corner)
+        if node.kind == "sphere":
+            radius = _resolve_sphere_radius(node.params)
+            return Bounds3D(Vector((-radius, -radius, -radius)), Vector((radius, radius, radius)))
+        if node.kind == "cylinder":
+            height = float(node.params.get("h", node.params.get("_positional", [1.0])[0] if node.params.get("_positional") else 1.0))
+            radius_bottom = _resolve_radius(node.params, "r", "d", "r1", "d1", fallback=1.0)
+            radius_top = _resolve_radius(node.params, "r", "d", "r2", "d2", fallback=radius_bottom)
+            radius = max(radius_bottom, radius_top)
+            if bool(node.params.get("center", False)):
+                return Bounds3D(Vector((-radius, -radius, -height / 2.0)), Vector((radius, radius, height / 2.0)))
+            return Bounds3D(Vector((-radius, -radius, 0.0)), Vector((radius, radius, height)))
+
+    if isinstance(node, TransformNode):
+        child_bounds = _measure_ir_bounds(node.child)
+        matrix = _transform_matrix_for_node(node, child_bounds)
+        return _transform_bounds(child_bounds, matrix)
+
+    if isinstance(node, BooleanNode):
+        child_bounds = [_measure_ir_bounds(child) for child in node.children]
+        if not child_bounds:
+            raise BlenderConversionError(f"Boolean node {node.kind}() has no children")
+        if node.kind == "difference":
+            return child_bounds[0]
+        if node.kind == "intersection":
+            min_corner = Vector((
+                max(bounds.min_corner[0] for bounds in child_bounds),
+                max(bounds.min_corner[1] for bounds in child_bounds),
+                max(bounds.min_corner[2] for bounds in child_bounds),
+            ))
+            max_corner = Vector((
+                min(bounds.max_corner[0] for bounds in child_bounds),
+                min(bounds.max_corner[1] for bounds in child_bounds),
+                min(bounds.max_corner[2] for bounds in child_bounds),
+            ))
+            return Bounds3D(min_corner, max_corner)
+        return _merge_bounds(child_bounds)
+
+    if isinstance(node, ExtrudeNode):
+        profile = _compile_2d(node.child)
+        min_x = min(point[0] for point in profile.points)
+        max_x = max(point[0] for point in profile.points)
+        min_y = min(point[1] for point in profile.points)
+        max_y = max(point[1] for point in profile.points)
+        if node.kind == "linear_extrude":
+            height = float(node.params.get("height", node.params.get("_positional", [1.0])[0] if node.params.get("_positional") else 1.0))
+            if bool(node.params.get("center", False)):
+                return Bounds3D(Vector((min_x, min_y, -height / 2.0)), Vector((max_x, max_y, height / 2.0)))
+            return Bounds3D(Vector((min_x, min_y, 0.0)), Vector((max_x, max_y, height)))
+        if node.kind == "rotate_extrude":
+            radius = max(max(abs(point[0]) for point in profile.points), 0.0)
+            return Bounds3D(Vector((-radius, -radius, min_y)), Vector((radius, radius, max_y)))
+
+    raise BlenderConversionError(f"Cannot measure bounds for {type(node).__name__}")
+
+
+def _merge_bounds(bounds_list: list[Bounds3D]) -> Bounds3D:
+    return Bounds3D(
+        Vector((
+            min(bounds.min_corner[0] for bounds in bounds_list),
+            min(bounds.min_corner[1] for bounds in bounds_list),
+            min(bounds.min_corner[2] for bounds in bounds_list),
+        )),
+        Vector((
+            max(bounds.max_corner[0] for bounds in bounds_list),
+            max(bounds.max_corner[1] for bounds in bounds_list),
+            max(bounds.max_corner[2] for bounds in bounds_list),
+        )),
+    )
+
+
+def _transform_bounds(bounds: Bounds3D, matrix: Matrix) -> Bounds3D:
+    corners = [
+        Vector((x, y, z, 1.0))
+        for x in (bounds.min_corner[0], bounds.max_corner[0])
+        for y in (bounds.min_corner[1], bounds.max_corner[1])
+        for z in (bounds.min_corner[2], bounds.max_corner[2])
+    ]
+    transformed = [matrix @ corner for corner in corners]
+    return Bounds3D(
+        Vector((
+            min(corner[0] for corner in transformed),
+            min(corner[1] for corner in transformed),
+            min(corner[2] for corner in transformed),
+        )),
+        Vector((
+            max(corner[0] for corner in transformed),
+            max(corner[1] for corner in transformed),
+            max(corner[2] for corner in transformed),
+        )),
+    )
+
+
+def _transform_matrix_for_node(node: TransformNode, child_bounds: Bounds3D) -> Matrix:
+    if node.kind == "translate":
+        return Matrix.Translation(Vector(_vector3(_first_argument(node.params, "v"))))
+    if node.kind == "rotate":
+        return _rotation_matrix(node.params)
+    if node.kind == "scale":
+        vector = _vector3(_first_argument(node.params, "v", default=1.0))
+        return Matrix.Diagonal(Vector((vector[0], vector[1], vector[2], 1.0)))
+    if node.kind == "mirror":
+        scale = _mirror_scale_vector(_vector3(_first_argument(node.params, "v")))
+        return Matrix.Diagonal(Vector((scale[0], scale[1], scale[2], 1.0)))
+    if node.kind == "multmatrix":
+        return _matrix4(_first_argument(node.params, "m"))
+    if node.kind == "resize":
+        target = _vector3(_first_argument(node.params, "newsize"))
+        current_size = child_bounds.size
+        center = child_bounds.center
+        scale = Vector((
+            1.0 if math.isclose(target[0], 0.0) else target[0] / current_size[0],
+            1.0 if math.isclose(target[1], 0.0) else target[1] / current_size[1],
+            1.0 if math.isclose(target[2], 0.0) else target[2] / current_size[2],
+        ))
+        return Matrix.Translation(center) @ Matrix.Diagonal(Vector((scale[0], scale[1], scale[2], 1.0))) @ Matrix.Translation(-center)
+    raise BlenderConversionError(f"Unsupported transform for bounds: {node.kind}")
+
+
+def _transform_components(node: TransformNode, child_bounds: Bounds3D) -> tuple[Vector, Euler, Vector]:
+    if node.kind == "translate":
+        return Vector(_vector3(_first_argument(node.params, "v"))), Euler((0.0, 0.0, 0.0)), Vector((1.0, 1.0, 1.0))
+    if node.kind == "rotate":
+        matrix = _rotation_matrix(node.params)
+        return _matrix_to_components(matrix)
+    if node.kind == "scale":
+        scale = _vector3(_first_argument(node.params, "v", default=1.0))
+        return Vector((0.0, 0.0, 0.0)), Euler((0.0, 0.0, 0.0)), Vector(scale)
+    if node.kind == "mirror":
+        scale = _mirror_scale_vector(_vector3(_first_argument(node.params, "v")))
+        return Vector((0.0, 0.0, 0.0)), Euler((0.0, 0.0, 0.0)), Vector(scale)
+    if node.kind == "multmatrix":
+        return _matrix_to_components(_matrix4(_first_argument(node.params, "m")))
+    if node.kind == "resize":
+        target = _vector3(_first_argument(node.params, "newsize"))
+        current_size = child_bounds.size
+        center = child_bounds.center
+        scale = Vector((
+            _resize_scale_component(target[0], current_size[0]),
+            _resize_scale_component(target[1], current_size[1]),
+            _resize_scale_component(target[2], current_size[2]),
+        ))
+        translation = Vector((
+            center[0] - scale[0] * center[0],
+            center[1] - scale[1] * center[1],
+            center[2] - scale[2] * center[2],
+        ))
+        return translation, Euler((0.0, 0.0, 0.0)), scale
+    raise BlenderConversionError(f"Unsupported transform for Geometry Nodes: {node.kind}")
+
+
+def _matrix_to_components(matrix: Matrix) -> tuple[Vector, Euler, Vector]:
+    location, rotation, scale = matrix.decompose()
+    return Vector(location), rotation.to_euler("XYZ"), Vector(scale)
+
+
+def _resize_scale_component(target: float, source: float) -> float:
+    if math.isclose(target, 0.0):
+        return 1.0
+    if math.isclose(source, 0.0):
+        raise BlenderConversionError("resize() cannot resize a zero-size dimension")
+    return target / source
+
+
+def _mirror_scale_vector(normal_value: tuple[float, float, float]) -> tuple[float, float, float]:
+    vector = Vector(normal_value)
+    if math.isclose(vector.length, 0.0):
+        raise BlenderConversionError("mirror() requires a non-zero normal")
+    normalized = Vector((round(component / vector.length, 6) for component in normal_value))
+    axis_candidates = {
+        (1.0, 0.0, 0.0): (-1.0, 1.0, 1.0),
+        (-1.0, 0.0, 0.0): (-1.0, 1.0, 1.0),
+        (0.0, 1.0, 0.0): (1.0, -1.0, 1.0),
+        (0.0, -1.0, 0.0): (1.0, -1.0, 1.0),
+        (0.0, 0.0, 1.0): (1.0, 1.0, -1.0),
+        (0.0, 0.0, -1.0): (1.0, 1.0, -1.0),
+    }
+    for axis, scale in axis_candidates.items():
+        if all(math.isclose(normalized[index], axis[index], abs_tol=1e-6) for index in range(3)):
+            return scale
+    raise BlenderConversionError("mirror() in the Blender 5.1 GN path currently supports only axis-aligned normals")
 
 
 def _segment_count(radius: float, tessellation: dict) -> int:
@@ -596,6 +1044,18 @@ def _sphere_segment_count(radius: float, tessellation: dict) -> int:
     if fn >= 8:
         return fn
     return _segment_count(radius, tessellation)
+
+
+def _resolve_sphere_radius(params: dict) -> float:
+    positional = params.get("_positional", [])
+    radius = params.get("r")
+    if radius is None and "d" in params:
+        radius = float(params["d"]) / 2.0
+    if radius is None and positional:
+        radius = positional[0]
+    if radius is None:
+        radius = 1.0
+    return float(radius)
 
 
 def _resolve_radius(params: dict, radius_key: str, diameter_key: str, alt_radius_key: str, alt_diameter_key: str, *, fallback: float) -> float:
