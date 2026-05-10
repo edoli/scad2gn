@@ -55,6 +55,43 @@ class Scad2GnCoreTests(unittest.TestCase):
             result = compare_stl_meshes(first, second)
             self.assertTrue(result["passed"])
 
+    def test_stl_compare_reports_warning_below_failure_tolerance(self):
+        reference_stl = textwrap.dedent(
+            """
+            solid sample
+              facet normal 0 0 1
+                outer loop
+                  vertex 0 0 0
+                  vertex 1 0 0
+                  vertex 0 1 0
+                endloop
+              endfacet
+            endsolid sample
+            """
+        ).strip()
+        shifted_stl = textwrap.dedent(
+            """
+            solid sample
+              facet normal 0 0 1
+                outer loop
+                  vertex 0.02 0 0
+                  vertex 1.02 0 0
+                  vertex 0.02 1 0
+                endloop
+              endfacet
+            endsolid sample
+            """
+        ).strip()
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.stl"
+            second = Path(directory) / "second.stl"
+            first.write_text(reference_stl, encoding="utf-8")
+            second.write_text(shifted_stl, encoding="utf-8")
+            result = compare_stl_meshes(first, second)
+            self.assertTrue(result["passed"])
+            self.assertTrue(result["warning"])
+            self.assertTrue(result["warnings"])
+
 
 if __name__ == "__main__":
     unittest.main()

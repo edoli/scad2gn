@@ -96,15 +96,24 @@ def main() -> int:
         "\n".join(
             ["# Validation Report", ""]
             + [
-                f"- {'PASS' if result['passed'] else 'FAIL'} `{result['case']}` `{parameter_slug(result['parameters'])}`"
+                f"- {_result_status(result)} `{result['case']}` `{parameter_slug(result['parameters'])}`"
                 for result in results
             ]
         ),
         encoding="utf-8",
     )
     failures = [result for result in results if not result["passed"]]
-    print(f"Validated {len(results)} case(s), failures: {len(failures)}")
+    warnings = [result for result in results if result.get("warning")]
+    print(f"Validated {len(results)} case(s), failures: {len(failures)}, warnings: {len(warnings)}")
     return 1 if failures else 0
+
+
+def _result_status(result: dict) -> str:
+    if not result["passed"]:
+        return "FAIL"
+    if result.get("warning"):
+        return "WARN"
+    return "PASS"
 
 
 if __name__ == "__main__":

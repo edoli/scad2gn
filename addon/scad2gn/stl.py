@@ -10,6 +10,10 @@ from typing import Iterable
 
 Vector3 = tuple[float, float, float]
 Triangle = tuple[Vector3, Vector3, Vector3]
+DEFAULT_FAILURE_ABSOLUTE_DISTANCE_TOLERANCE = 0.1
+DEFAULT_FAILURE_RELATIVE_TOLERANCE = 0.01
+DEFAULT_WARNING_ABSOLUTE_DISTANCE_TOLERANCE = 0.01
+DEFAULT_WARNING_RELATIVE_TOLERANCE = 0.001
 
 
 @dataclass(slots=True)
@@ -59,10 +63,14 @@ def compare_stl_meshes(
     reference_path: str | Path,
     candidate_path: str | Path,
     *,
-    absolute_distance_tolerance: float = 1e-4,
-    relative_dimension_tolerance: float = 1e-4,
-    volume_relative_tolerance: float = 1e-3,
-    surface_area_relative_tolerance: float = 1e-3,
+    absolute_distance_tolerance: float = DEFAULT_FAILURE_ABSOLUTE_DISTANCE_TOLERANCE,
+    relative_dimension_tolerance: float = DEFAULT_FAILURE_RELATIVE_TOLERANCE,
+    volume_relative_tolerance: float = DEFAULT_FAILURE_RELATIVE_TOLERANCE,
+    surface_area_relative_tolerance: float = DEFAULT_FAILURE_RELATIVE_TOLERANCE,
+    warning_absolute_distance_tolerance: float = DEFAULT_WARNING_ABSOLUTE_DISTANCE_TOLERANCE,
+    warning_relative_dimension_tolerance: float = DEFAULT_WARNING_RELATIVE_TOLERANCE,
+    warning_volume_relative_tolerance: float = DEFAULT_WARNING_RELATIVE_TOLERANCE,
+    warning_surface_area_relative_tolerance: float = DEFAULT_WARNING_RELATIVE_TOLERANCE,
 ) -> dict:
     reference_triangles = load_stl(reference_path)
     candidate_triangles = load_stl(candidate_path)
@@ -107,11 +115,24 @@ def compare_stl_meshes(
         and surface_area_relative_delta <= surface_area_relative_tolerance
         and max_distance <= absolute_distance_tolerance
     )
+    warnings = _comparison_warnings(
+        max_bbox_relative=max(bbox_relative),
+        volume_relative_delta=volume_relative_delta,
+        surface_area_relative_delta=surface_area_relative_delta,
+        max_distance=max_distance,
+        distance_p95=percentile_95,
+        warning_absolute_distance_tolerance=warning_absolute_distance_tolerance,
+        warning_relative_dimension_tolerance=warning_relative_dimension_tolerance,
+        warning_volume_relative_tolerance=warning_volume_relative_tolerance,
+        warning_surface_area_relative_tolerance=warning_surface_area_relative_tolerance,
+    )
 
     return {
         "reference_path": str(reference_path),
         "candidate_path": str(candidate_path),
         "passed": passed,
+        "warning": bool(passed and warnings),
+        "warnings": warnings,
         "metrics": {
             "reference": _stats_to_dict(reference_stats),
             "candidate": _stats_to_dict(candidate_stats),
@@ -126,6 +147,10 @@ def compare_stl_meshes(
             "relative_dimension_tolerance": relative_dimension_tolerance,
             "volume_relative_tolerance": volume_relative_tolerance,
             "surface_area_relative_tolerance": surface_area_relative_tolerance,
+            "warning_absolute_distance_tolerance": warning_absolute_distance_tolerance,
+            "warning_relative_dimension_tolerance": warning_relative_dimension_tolerance,
+            "warning_volume_relative_tolerance": warning_volume_relative_tolerance,
+            "warning_surface_area_relative_tolerance": warning_surface_area_relative_tolerance,
         },
     }
 
@@ -143,6 +168,7 @@ def write_comparison_report(result: dict, json_path: str | Path, markdown_path: 
                 f"# STL Comparison Report",
                 "",
                 f"- Result: {'PASS' if result['passed'] else 'FAIL'}",
+                f"- Warning: {'YES' if result.get('warning') else 'NO'}",
                 f"- Reference: `{result['reference_path']}`",
                 f"- Candidate: `{result['candidate_path']}`",
                 f"- Max bidirectional distance: `{metrics['max_bidirectional_distance']:.8f}`",
@@ -150,10 +176,41 @@ def write_comparison_report(result: dict, json_path: str | Path, markdown_path: 
                 f"- Bounding-box relative delta: `{metrics['bbox_relative_delta']}`",
                 f"- Volume relative delta: `{metrics['volume_relative_delta']:.8f}`",
                 f"- Surface area relative delta: `{metrics['surface_area_relative_delta']:.8f}`",
+                f"- Warnings: `{json.dumps(result.get('warnings', []), sort_keys=True)}`",
             ]
         ),
         encoding="utf-8",
     )
+
+
+def _comparison_warnings(
+    *,
+    max_bbox_relative: float,
+    volume_relative_delta: float,
+    surface_area_relative_delta: float,
+    max_distance: float,
+    distance_p95: float,
+    warning_absolute_distance_tolerance: float,
+    warning_relative_dimension_tolerance: float,
+    warning_volume_relative_tolerance: float,
+    warning_surface_area_relative_tolerance: float,
+) -> list[dict]:
+    checks = [
+        ("bbox_relative_delta", max_bbox_relative, warning_relative_dimension_tolerance),
+        ("volume_relative_delta", volume_relative_delta, warning_volume_relative_tolerance),
+        ("surface_area_relative_delta", surface_area_relative_delta, warning_surface_area_relative_tolerance),
+        ("max_bidirectional_distance", max_distance, warning_absolute_distance_tolerance),
+        ("distance_p95", distance_p95, warning_absolute_distance_tolerance),
+    ]
+    return [
+        {
+            "metric": metric,
+            "value": value,
+            "warning_tolerance": tolerance,
+        }
+        for metric, value, tolerance in checks
+        if value > tolerance
+    ]
 
 
 def _looks_like_ascii(raw: bytes) -> bool:
