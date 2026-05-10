@@ -689,16 +689,33 @@ class _GeometryNodesBuilder:
         y: float,
     ):
         translation, rotation, scale = _transform_components(node, child_bounds)
-        return self._add_transform(child_socket, translation, rotation, scale, x, y)
+        flip_faces = _transform_flips_faces(node, child_bounds)
+        return self._add_transform(child_socket, translation, rotation, scale, x, y, flip_faces=flip_faces)
 
-    def _add_transform(self, geometry_socket, translation: Vector, rotation: Euler, scale: Vector, x: float, y: float):
+    def _add_transform(
+        self,
+        geometry_socket,
+        translation: Vector,
+        rotation: Euler,
+        scale: Vector,
+        x: float,
+        y: float,
+        *,
+        flip_faces: bool = False,
+    ):
         transform = self.group.nodes.new("GeometryNodeTransform")
         transform.location = (x, y)
         self.group.links.new(geometry_socket, transform.inputs["Geometry"])
         transform.inputs["Translation"].default_value = translation
         transform.inputs["Rotation"].default_value = rotation
         transform.inputs["Scale"].default_value = scale
-        return transform.outputs["Geometry"]
+        geometry = transform.outputs["Geometry"]
+        if flip_faces:
+            flip = self.group.nodes.new("GeometryNodeFlipFaces")
+            flip.location = (x + 220, y)
+            self.group.links.new(geometry, flip.inputs["Mesh"])
+            geometry = flip.outputs["Mesh"]
+        return geometry
 
     def _build_boolean(self, node: BooleanNode, x: float, y: float):
         if not node.children:
@@ -1003,6 +1020,12 @@ def _transform_components(node: TransformNode, child_bounds: Bounds3D) -> tuple[
         ))
         return translation, Euler((0.0, 0.0, 0.0)), scale
     raise BlenderConversionError(f"Unsupported transform for Geometry Nodes: {node.kind}")
+
+
+def _transform_flips_faces(node: TransformNode, child_bounds: Bounds3D) -> bool:
+    matrix = _transform_matrix_for_node(node, child_bounds)
+    determinant = matrix.to_3x3().determinant()
+    return determinant < 0.0
 
 
 def _matrix_to_components(matrix: Matrix) -> tuple[Vector, Euler, Vector]:
