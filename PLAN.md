@@ -291,6 +291,40 @@ Support both explicit combinations and Cartesian-product style definitions.
 For large parameter spaces, avoid generating excessive combinations by default. Allow each test case to define a maximum or curated set of representative cases.
 
 
+## Blender Parameter and Customizer UI
+
+Imported `.scad` files should eventually expose editable parameters in Blender in a way that is close to OpenSCAD's Customizer panel.
+
+Goals:
+
+* Detect top-level OpenSCAD variables that are safe to expose as user-editable parameters.
+* Preserve default values from the `.scad` file.
+* Parse OpenSCAD Customizer-style comments where practical, including labels, descriptions, ranges, steps, option lists, and grouping.
+* Create Blender UI controls for exposed parameters using appropriate control types:
+  * numeric inputs and sliders for numbers and ranges
+  * checkboxes for booleans
+  * dropdowns for enumerated options
+  * vector controls for vector values
+  * text inputs for strings where supported
+* Keep the Blender UI synchronized with the generated Geometry Nodes group inputs.
+* Support updating the object by changing Blender-side parameter values
+
+Geometry Nodes parameter rules:
+
+* Exposable top-level SCAD variables should become Geometry Nodes group input sockets when their values influence supported procedural geometry.
+* Primitive and transform node inputs should use socket links instead of hard-coded constants where the value depends on an exposed parameter.
+* Expression-derived values should remain linked to parameter sockets where practical, using Geometry Nodes math/vector nodes instead of baking the evaluated result.
+* If an expression cannot yet be represented procedurally in Geometry Nodes, document the limitation and either rebuild the node tree on parameter change or mark that parameter as non-live.
+
+The long-term user experience should be:
+
+1. Import a `.scad` file.
+2. See the same meaningful parameters that would appear in OpenSCAD's Customizer.
+3. Adjust those parameters in Blender.
+4. Have Geometry Nodes update the generated geometry procedurally.
+5. Export or validate the updated result.
+
+
 ## Supported OpenSCAD Features
 
 Implement features incrementally.
