@@ -31,6 +31,13 @@ class BooleanNode(IRNode):
 
 
 @dataclass(slots=True)
+class ConditionalNode(IRNode):
+    condition: Any
+    then_branch: IRNode | None
+    else_branch: IRNode | None
+
+
+@dataclass(slots=True)
 class ExtrudeNode(IRNode):
     kind: str
     params: dict[str, Any]

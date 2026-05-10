@@ -10,11 +10,15 @@ import bmesh
 import bpy
 from mathutils import Euler, Matrix, Vector
 
+from .customizer import collect_customizer_parameters_from_source
+from .dynamic_values import DynamicExpression, contains_dynamic, is_dynamic
 from .errors import BlenderConversionError, EvaluationError
-from .ir import BooleanNode, ExtrudeNode, IRNode, PrimitiveNode, TransformNode
-from .runtime import collect_top_level_defaults, load_ir_from_file
+from .evaluator import Evaluator
+from .ir import BooleanNode, ConditionalNode, ExtrudeNode, IRNode, PrimitiveNode, TransformNode
+from .runtime import collect_top_level_defaults, load_program_from_file
 
 GENERATED_COLLECTION_NAME = "SCAD2GN Generated"
+_VECTOR_COMPONENT_LABELS = ("X", "Y", "Z", "W")
 
 
 @dataclass(slots=True)
@@ -57,11 +61,11 @@ def clear_scene() -> None:
 def create_scad_object(scad_path: str, parameters: dict | None = None, object_name: str | None = None):
     source_path = Path(scad_path)
     params = parameters or {}
-    ir = load_ir_from_file(source_path, params)
+    ir, customizer_parameters = _load_parameterized_ir(source_path, params)
     if ir is None:
         raise BlenderConversionError(f"No geometry generated for {source_path}")
 
-    wrapper = _create_wrapper_object(ir, object_name or source_path.stem)
+    wrapper = _create_wrapper_object(ir, object_name or source_path.stem, customizer_parameters)
     defaults = collect_top_level_defaults(source_path)
     wrapper["scad_source_path"] = str(source_path)
     wrapper["scad_params_json"] = json.dumps(params, sort_keys=True)
@@ -81,13 +85,13 @@ def rebuild_scad_object(wrapper_object, parameters: dict | None = None):
         raw_params = wrapper_object.get("scad_params_json", "{}")
         params = json.loads(raw_params)
 
-    ir = load_ir_from_file(source_path, params)
+    ir, customizer_parameters = _load_parameterized_ir(source_path, params)
     if ir is None:
         raise BlenderConversionError(f"No geometry generated for {source_path}")
 
     defaults = collect_top_level_defaults(source_path)
     _cleanup_helper_objects(wrapper_object.name)
-    new_group = _build_wrapper_node_group(wrapper_object.name, ir)
+    new_group = _build_wrapper_node_group(wrapper_object.name, ir, customizer_parameters)
     modifier = _ensure_nodes_modifier(wrapper_object)
     old_group = modifier.node_group
     modifier.node_group = new_group
@@ -128,6 +132,19 @@ def export_wrapper_to_stl(wrapper_object, output_path: str) -> None:
         return
 
     raise BlenderConversionError("No STL export operator is available in this Blender build")
+
+
+def _load_parameterized_ir(source_path: str | Path, parameters: dict | None = None):
+    source_path = Path(source_path)
+    source = source_path.read_text(encoding="utf-8")
+    program = load_program_from_file(source_path)
+    customizer_parameters = collect_customizer_parameters_from_source(
+        source,
+        path=str(source_path),
+        program=program,
+    )
+    evaluator = Evaluator(parameters=parameters, path=str(source_path))
+    return evaluator.evaluate_parameterized(program, customizer_parameters)
 
 
 def _compile_3d(node: IRNode, name: str):
@@ -550,23 +567,26 @@ def _link_mesh_object(name: str, mesh):
     return obj
 
 
-def _create_wrapper_object(ir: IRNode, display_name: str):
+def _create_wrapper_object(ir: IRNode, display_name: str, customizer_parameters: list):
     collection = _ensure_generated_collection()
     mesh = bpy.data.meshes.new(f"{display_name}_HostMesh")
     wrapper = bpy.data.objects.new(display_name, mesh)
     collection.objects.link(wrapper)
-    node_group = _build_wrapper_node_group(display_name, ir)
+    node_group = _build_wrapper_node_group(display_name, ir, customizer_parameters)
     modifier = _ensure_nodes_modifier(wrapper)
     modifier.node_group = node_group
     return wrapper
 
 
-def _build_wrapper_node_group(display_name: str, ir: IRNode):
+def _build_wrapper_node_group(display_name: str, ir: IRNode, customizer_parameters: list):
     group = bpy.data.node_groups.new(f"{display_name}_GN", "GeometryNodeTree")
+    parameter_outputs = _build_customizer_interface(group, customizer_parameters)
     group.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    group_input = group.nodes.new("NodeGroupInput")
+    group_input.location = (-1200, 0)
     output = group.nodes.new("NodeGroupOutput")
     output.location = (1200, 0)
-    builder = _GeometryNodesBuilder(group, display_name)
+    builder = _GeometryNodesBuilder(group, display_name, group_input, parameter_outputs)
     geometry_socket = builder.build_geometry(ir, 0, 0)
     group.links.new(geometry_socket, output.inputs["Geometry"])
     return group
@@ -595,10 +615,93 @@ def _cleanup_helper_objects(owner_name: str) -> None:
             bpy.data.objects.remove(obj, do_unlink=True)
 
 
+def _build_customizer_interface(group, customizer_parameters: list) -> dict[tuple[str, int | None], int]:
+    parameter_outputs: dict[tuple[str, int | None], int] = {}
+    panels: dict[str, object] = {}
+    output_index = 0
+    for parameter in customizer_parameters:
+        parent = None
+        if parameter.section:
+            parent = panels.get(parameter.section)
+            if parent is None:
+                parent = group.interface.new_panel(parameter.section)
+                panels[parameter.section] = parent
+        if parameter.kind == "vector":
+            for index, component_kind in enumerate(parameter.component_kinds):
+                socket_type = "NodeSocketInt" if component_kind == "int" else "NodeSocketFloat"
+                socket = group.interface.new_socket(
+                    name=f"{parameter.display_name} {_VECTOR_COMPONENT_LABELS[index]}",
+                    in_out="INPUT",
+                    socket_type=socket_type,
+                    parent=parent,
+                )
+                _configure_customizer_socket(socket, parameter, parameter.default[index], component_kind=component_kind)
+                parameter_outputs[(parameter.name, index)] = output_index
+                output_index += 1
+            continue
+
+        socket = group.interface.new_socket(
+            name=parameter.display_name,
+            in_out="INPUT",
+            socket_type=_socket_type_for_parameter(parameter.kind),
+            parent=parent,
+        )
+        _configure_customizer_socket(socket, parameter, parameter.default, component_kind=parameter.kind)
+        parameter_outputs[(parameter.name, None)] = output_index
+        output_index += 1
+    return parameter_outputs
+
+
+def _socket_type_for_parameter(kind: str) -> str:
+    if kind == "bool":
+        return "NodeSocketBool"
+    if kind == "int":
+        return "NodeSocketInt"
+    if kind == "float":
+        return "NodeSocketFloat"
+    if kind == "string":
+        return "NodeSocketString"
+    raise BlenderConversionError(f"Unsupported customizer parameter type: {kind}")
+
+
+def _configure_customizer_socket(socket, parameter, value, *, component_kind: str) -> None:
+    details = []
+    if parameter.description:
+        details.append(parameter.description)
+    if parameter.choices:
+        details.append(
+            "Choices: " + ", ".join(
+                f"{choice.value} ({choice.label})" if choice.label else str(choice.value)
+                for choice in parameter.choices
+            )
+        )
+    if parameter.step is not None:
+        details.append(f"Step hint: {parameter.step}")
+    if details:
+        socket.description = "\n".join(details)
+
+    if component_kind == "int":
+        socket.default_value = int(round(float(value)))
+    elif component_kind == "float":
+        socket.default_value = float(value)
+    elif component_kind == "bool":
+        socket.default_value = bool(value)
+    else:
+        socket.default_value = str(value)
+    if component_kind in {"int", "float"}:
+        if parameter.minimum is not None:
+            socket.min_value = int(parameter.minimum) if component_kind == "int" else float(parameter.minimum)
+        if parameter.maximum is not None:
+            socket.max_value = int(parameter.maximum) if component_kind == "int" else float(parameter.maximum)
+
+
 class _GeometryNodesBuilder:
-    def __init__(self, group, owner_name: str) -> None:
+    def __init__(self, group, owner_name: str, group_input, parameter_outputs: dict[tuple[str, int | None], int]) -> None:
         self.group = group
         self.owner_name = owner_name
+        self.group_input = group_input
+        self.parameter_outputs = parameter_outputs
+        self._empty_geometry_socket = None
 
     def build_geometry(self, node: IRNode, x: float, y: float):
         if isinstance(node, PrimitiveNode):
@@ -608,31 +711,59 @@ class _GeometryNodesBuilder:
             if _node_dimension(node.child) == 2:
                 raise BlenderConversionError(f"2D transform {node.kind}() must be consumed by an extrusion node")
             child_socket = self.build_geometry(node.child, x - 220, y)
-            child_bounds = _measure_ir_bounds(node.child)
+            child_bounds = None if _transform_supports_dynamic(node) else _measure_ir_bounds(node.child)
             return self._build_transform(node, child_socket, child_bounds, x, y)
 
         if isinstance(node, BooleanNode):
             return self._build_boolean(node, x, y)
+
+        if isinstance(node, ConditionalNode):
+            return self._build_conditional(node, x, y)
 
         if isinstance(node, ExtrudeNode):
             return self._build_extrude(node, x, y)
 
         raise BlenderConversionError(f"Unsupported IR node for Geometry Nodes: {type(node).__name__}")
 
+    def build_curve(self, node: IRNode, x: float, y: float):
+        if isinstance(node, PrimitiveNode):
+            return self._build_profile_primitive(node, x, y)
+
+        if isinstance(node, TransformNode):
+            child_curve = self.build_curve(node.child, x - 240, y)
+            return self._build_curve_transform(node, child_curve, x, y)
+
+        raise BlenderConversionError(f"Unsupported 2D IR node for Geometry Nodes: {type(node).__name__}")
+
     def _build_primitive(self, node: PrimitiveNode, x: float, y: float):
         if node.kind == "cube":
             primitive = self.group.nodes.new("GeometryNodeMeshCube")
             primitive.location = (x, y)
-            size = _vector3(node.params.get("size", node.params.get("_positional", [1.0])[0] if node.params.get("_positional") else 1.0))
-            primitive.inputs["Size"].default_value = size
+            size_value = node.params.get("size", node.params.get("_positional", [1.0])[0] if node.params.get("_positional") else 1.0)
+            size = _value_vector3(size_value)
+            self._set_vector_input(primitive.inputs["Size"], size, x - 180, y - 120)
             primitive.inputs["Vertices X"].default_value = 2
             primitive.inputs["Vertices Y"].default_value = 2
             primitive.inputs["Vertices Z"].default_value = 2
             geometry = primitive.outputs["Mesh"]
-            if not bool(node.params.get("center", False)):
+            center_value = node.params.get("center", False)
+            if contains_dynamic(center_value):
+                translation = [
+                    self._switch_number_from_bool(center_value, _divide_number(size[index], 2.0), 0.0, x + 20, y - (index * 80))
+                    for index in range(3)
+                ]
                 geometry = self._add_transform(
                     geometry,
-                    Vector((size[0] / 2.0, size[1] / 2.0, size[2] / 2.0)),
+                    translation,
+                    Euler((0.0, 0.0, 0.0)),
+                    Vector((1.0, 1.0, 1.0)),
+                    x + 220,
+                    y,
+                )
+            elif not bool(center_value):
+                geometry = self._add_transform(
+                    geometry,
+                    [_divide_number(size[0], 2.0), _divide_number(size[1], 2.0), _divide_number(size[2], 2.0)],
                     Euler((0.0, 0.0, 0.0)),
                     Vector((1.0, 1.0, 1.0)),
                     x + 220,
@@ -643,34 +774,46 @@ class _GeometryNodesBuilder:
         if node.kind == "sphere":
             primitive = self.group.nodes.new("GeometryNodeMeshUVSphere")
             primitive.location = (x, y)
-            radius = _resolve_sphere_radius(node.params)
+            radius = _resolve_sphere_radius_value(node.params)
             tessellation = node.params.get("_tessellation", {})
             segments = _sphere_segment_count(radius, tessellation)
-            primitive.inputs["Segments"].default_value = max(3, segments)
-            primitive.inputs["Rings"].default_value = max(2, segments // 2)
-            primitive.inputs["Radius"].default_value = radius
+            rings = _sphere_ring_count_value(segments)
+            self._set_number_input(primitive.inputs["Segments"], _max_number_value(segments, 3), x - 180, y - 80)
+            self._set_number_input(primitive.inputs["Rings"], _max_number_value(rings, 2), x - 180, y - 160)
+            self._set_number_input(primitive.inputs["Radius"], radius, x - 180, y)
             return primitive.outputs["Mesh"]
 
         if node.kind == "cylinder":
             primitive = self.group.nodes.new("GeometryNodeMeshCone")
             primitive.location = (x, y)
-            height = float(node.params.get("h", node.params.get("_positional", [1.0])[0] if node.params.get("_positional") else 1.0))
-            radius_bottom = _resolve_radius(node.params, "r", "d", "r1", "d1", fallback=1.0)
-            radius_top = _resolve_radius(node.params, "r", "d", "r2", "d2", fallback=radius_bottom)
+            height = _height_value(node.params)
+            radius_bottom = _resolve_radius_value(node.params, "r", "d", "r1", "d1", fallback=1.0)
+            radius_top = _resolve_radius_value(node.params, "r", "d", "r2", "d2", fallback=radius_bottom)
             tessellation = node.params.get("_tessellation", {})
-            segments = _segment_count(max(radius_bottom, radius_top), tessellation)
-            primitive.inputs["Vertices"].default_value = max(8, segments)
+            segments = _segment_count(_max_number_value(radius_bottom, radius_top), tessellation)
+            self._set_number_input(primitive.inputs["Vertices"], _max_number_value(segments, 8), x - 180, y - 80)
             primitive.inputs["Side Segments"].default_value = 1
             primitive.inputs["Fill Segments"].default_value = 1
-            primitive.inputs["Radius Top"].default_value = radius_top
-            primitive.inputs["Radius Bottom"].default_value = radius_bottom
-            primitive.inputs["Depth"].default_value = height
+            self._set_number_input(primitive.inputs["Radius Top"], radius_top, x - 180, y - 160)
+            self._set_number_input(primitive.inputs["Radius Bottom"], radius_bottom, x - 180, y - 240)
+            self._set_number_input(primitive.inputs["Depth"], height, x - 180, y)
             primitive.fill_type = "NGON"
             geometry = primitive.outputs["Mesh"]
-            if bool(node.params.get("center", False)):
+            center_value = node.params.get("center", False)
+            if contains_dynamic(center_value):
+                translation_z = self._switch_number_from_bool(center_value, 0.0, _divide_number(height, -2.0), x + 20, y - 40)
                 geometry = self._add_transform(
                     geometry,
-                    Vector((0.0, 0.0, -height / 2.0)),
+                    [0.0, 0.0, translation_z],
+                    Euler((0.0, 0.0, 0.0)),
+                    Vector((1.0, 1.0, 1.0)),
+                    x + 220,
+                    y,
+                )
+            elif bool(center_value):
+                geometry = self._add_transform(
+                    geometry,
+                    [0.0, 0.0, _divide_number(height, -2.0)],
                     Euler((0.0, 0.0, 0.0)),
                     Vector((1.0, 1.0, 1.0)),
                     x + 220,
@@ -684,20 +827,40 @@ class _GeometryNodesBuilder:
         self,
         node: TransformNode,
         child_socket,
-        child_bounds: Bounds3D,
+        child_bounds: Bounds3D | None,
         x: float,
         y: float,
     ):
-        translation, rotation, scale = _transform_components(node, child_bounds)
-        flip_faces = _transform_flips_faces(node, child_bounds)
+        if _transform_supports_dynamic(node):
+            translation, rotation, scale, flip_faces = self._dynamic_transform_components(node, x, y)
+        else:
+            if child_bounds is None:
+                raise BlenderConversionError(f"Transform {node.kind}() requires measurable bounds")
+            translation, rotation, scale = _transform_components(node, child_bounds)
+            flip_faces = _transform_flips_faces(node, child_bounds)
         return self._add_transform(child_socket, translation, rotation, scale, x, y, flip_faces=flip_faces)
+
+    def _build_conditional(self, node: ConditionalNode, x: float, y: float):
+        switch = self.group.nodes.new("GeometryNodeSwitch")
+        switch.location = (x, y)
+        switch.input_type = "GEOMETRY"
+        self._set_bool_input(switch.inputs["Switch"], node.condition, x - 220, y - 120)
+        self.group.links.new(
+            self.build_geometry(node.then_branch, x - 420, y + 180) if node.then_branch is not None else self._empty_geometry(),
+            switch.inputs["True"],
+        )
+        self.group.links.new(
+            self.build_geometry(node.else_branch, x - 420, y - 180) if node.else_branch is not None else self._empty_geometry(),
+            switch.inputs["False"],
+        )
+        return switch.outputs["Output"]
 
     def _add_transform(
         self,
         geometry_socket,
-        translation: Vector,
-        rotation: Euler,
-        scale: Vector,
+        translation,
+        rotation,
+        scale,
         x: float,
         y: float,
         *,
@@ -706,9 +869,9 @@ class _GeometryNodesBuilder:
         transform = self.group.nodes.new("GeometryNodeTransform")
         transform.location = (x, y)
         self.group.links.new(geometry_socket, transform.inputs["Geometry"])
-        transform.inputs["Translation"].default_value = translation
-        transform.inputs["Rotation"].default_value = rotation
-        transform.inputs["Scale"].default_value = scale
+        self._set_vector_input(transform.inputs["Translation"], translation, x - 180, y - 120)
+        self._set_vector_input(transform.inputs["Rotation"], rotation, x - 180, y - 220)
+        self._set_vector_input(transform.inputs["Scale"], scale, x - 180, y - 320)
         geometry = transform.outputs["Geometry"]
         if flip_faces:
             flip = self.group.nodes.new("GeometryNodeFlipFaces")
@@ -749,20 +912,20 @@ class _GeometryNodesBuilder:
         return current_socket
 
     def _build_extrude(self, node: ExtrudeNode, x: float, y: float):
-        profile = _compile_2d(node.child)
         if node.kind == "linear_extrude":
-            return self._build_linear_extrude(profile, node.params, x, y)
+            return self._build_linear_extrude(node.child, node.params, x, y)
         if node.kind == "rotate_extrude":
+            profile = _compile_2d(node.child)
             return self._build_rotate_extrude(profile, node.params, x, y)
         raise BlenderConversionError(f"Unsupported extrusion for Geometry Nodes: {node.kind}")
 
-    def _build_linear_extrude(self, profile: Profile2D, params: dict, x: float, y: float):
-        curve_socket = self._build_profile_curve(profile.points, x - 480, y)
-        height = float(params.get("height", params.get("_positional", [1.0])[0] if params.get("_positional") else 1.0))
+    def _build_linear_extrude(self, profile_node: IRNode, params: dict, x: float, y: float):
+        curve_socket = self.build_curve(profile_node, x - 480, y)
+        height = _height_value(params)
         path_line = self.group.nodes.new("GeometryNodeCurvePrimitiveLine")
         path_line.location = (x - 240, y + 160)
         path_line.inputs["Start"].default_value = (0.0, 0.0, 0.0)
-        path_line.inputs["End"].default_value = (0.0, 0.0, height)
+        self._set_vector_input(path_line.inputs["End"], [0.0, 0.0, height], x - 420, y + 60)
 
         curve_to_mesh = self.group.nodes.new("GeometryNodeCurveToMesh")
         curve_to_mesh.location = (x, y)
@@ -771,10 +934,21 @@ class _GeometryNodesBuilder:
         curve_to_mesh.inputs["Fill Caps"].default_value = True
         geometry = curve_to_mesh.outputs["Mesh"]
 
-        if bool(params.get("center", False)):
+        center_value = params.get("center", False)
+        if contains_dynamic(center_value):
+            translation_z = self._switch_number_from_bool(center_value, 0.0, _divide_number(height, -2.0), x + 20, y - 40)
             geometry = self._add_transform(
                 geometry,
-                Vector((0.0, 0.0, -height / 2.0)),
+                [0.0, 0.0, translation_z],
+                Euler((0.0, 0.0, 0.0)),
+                Vector((1.0, 1.0, 1.0)),
+                x + 220,
+                y,
+            )
+        elif bool(center_value):
+            geometry = self._add_transform(
+                geometry,
+                [0.0, 0.0, _divide_number(height, -2.0)],
                 Euler((0.0, 0.0, 0.0)),
                 Vector((1.0, 1.0, 1.0)),
                 x + 220,
@@ -812,6 +986,264 @@ class _GeometryNodesBuilder:
         self.group.links.new(profile_socket, curve_to_mesh.inputs["Profile Curve"])
         curve_to_mesh.inputs["Fill Caps"].default_value = True
         return curve_to_mesh.outputs["Mesh"]
+
+    def _build_profile_primitive(self, node: PrimitiveNode, x: float, y: float):
+        if node.kind == "circle":
+            primitive = self.group.nodes.new("GeometryNodeCurvePrimitiveCircle")
+            primitive.location = (x, y)
+            radius = _resolve_sphere_radius_value(node.params)
+            resolution = _segment_count(radius, node.params.get("_tessellation", {}))
+            self._set_number_input(primitive.inputs["Radius"], radius, x - 180, y)
+            self._set_number_input(primitive.inputs["Resolution"], _max_number_value(resolution, 8), x - 180, y - 80)
+            return primitive.outputs["Curve"]
+
+        if node.kind == "square":
+            primitive = self.group.nodes.new("GeometryNodeCurvePrimitiveQuadrilateral")
+            primitive.location = (x, y)
+            width, height = _value_vector2(node.params.get("size", node.params.get("_positional", [1.0])[0] if node.params.get("_positional") else 1.0))
+            self._set_number_input(primitive.inputs["Width"], width, x - 180, y)
+            self._set_number_input(primitive.inputs["Height"], height, x - 180, y - 80)
+            curve = primitive.outputs["Curve"]
+            center_value = node.params.get("center", node.params.get("_positional", [None, False])[1] if len(node.params.get("_positional", [])) > 1 else False)
+            if contains_dynamic(center_value):
+                translation = [
+                    self._switch_number_from_bool(center_value, _divide_number(width, 2.0), 0.0, x + 20, y),
+                    self._switch_number_from_bool(center_value, _divide_number(height, 2.0), 0.0, x + 20, y - 80),
+                    0.0,
+                ]
+                curve = self._transform_curve(curve, translation, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], x + 220, y)
+            elif not bool(center_value):
+                curve = self._transform_curve(curve, [_divide_number(width, 2.0), _divide_number(height, 2.0), 0.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], x + 220, y)
+            return curve
+
+        if node.kind == "polygon":
+            points = node.params.get("points")
+            if points is None and node.params.get("_positional"):
+                points = node.params["_positional"][0]
+            paths = node.params.get("paths")
+            if paths:
+                if not isinstance(paths, list) or len(paths) != 1:
+                    raise BlenderConversionError("polygon() currently supports only a single path")
+                points = [points[index] for index in paths[0]]
+            return self._build_profile_curve([tuple(_vector2(point)) for point in points], x, y)
+
+        raise BlenderConversionError(f"Unsupported 2D primitive for Geometry Nodes: {node.kind}")
+
+    def _build_curve_transform(self, node: TransformNode, child_curve, x: float, y: float):
+        if node.kind == "translate":
+            translation = [*_value_vector2(_first_argument_value(node.params, "v")), 0.0]
+            return self._transform_curve(child_curve, translation, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], x, y)
+        if node.kind == "rotate":
+            angle = _profile_rotation_value(node.params)
+            return self._transform_curve(child_curve, [0.0, 0.0, 0.0], [0.0, 0.0, _degrees_to_radians_value(angle)], [1.0, 1.0, 1.0], x, y)
+        if node.kind == "scale":
+            sx, sy = _value_vector2(_first_argument_value(node.params, "v", default=1.0))
+            return self._transform_curve(child_curve, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [sx, sy, 1.0], x, y)
+        if node.kind == "mirror":
+            if contains_dynamic(node.params):
+                raise BlenderConversionError("Dynamic mirror() is not supported in the Blender 5.1 GN path")
+            matrix = _mirror_matrix(_vector3(_first_argument(node.params, "v")))
+            location, rotation, scale = _matrix_to_components(matrix)
+            return self._transform_curve(child_curve, list(location), list(rotation), list(scale), x, y)
+        if node.kind == "multmatrix":
+            if contains_dynamic(node.params):
+                raise BlenderConversionError("Dynamic multmatrix() is not supported in the Blender 5.1 GN path")
+            matrix = _profile_transform_matrix(node)
+            location, rotation, scale = _matrix_to_components(matrix.to_4x4())
+            return self._transform_curve(child_curve, list(location), list(rotation), list(scale), x, y)
+        if node.kind == "resize":
+            raise BlenderConversionError("Dynamic resize() is not supported in the Blender 5.1 GN path")
+        raise BlenderConversionError(f"Unsupported 2D transform for Geometry Nodes: {node.kind}")
+
+    def _transform_curve(self, curve_socket, translation, rotation, scale, x: float, y: float):
+        transform = self.group.nodes.new("GeometryNodeTransform")
+        transform.location = (x, y)
+        self.group.links.new(curve_socket, transform.inputs["Geometry"])
+        self._set_vector_input(transform.inputs["Translation"], translation, x - 180, y - 120)
+        self._set_vector_input(transform.inputs["Rotation"], rotation, x - 180, y - 220)
+        self._set_vector_input(transform.inputs["Scale"], scale, x - 180, y - 320)
+        return transform.outputs["Geometry"]
+
+    def _set_number_input(self, socket, value, x: float, y: float) -> None:
+        if _is_socket_value(value):
+            self.group.links.new(value, socket)
+            return
+        if contains_dynamic(value):
+            self.group.links.new(self._build_number_socket(value, x, y), socket)
+            return
+        if getattr(socket, "type", "") == "INT":
+            socket.default_value = int(round(float(value)))
+        else:
+            socket.default_value = float(value) if isinstance(value, int) else value
+
+    def _set_bool_input(self, socket, value, x: float, y: float) -> None:
+        if _is_socket_value(value):
+            self.group.links.new(value, socket)
+            return
+        if contains_dynamic(value):
+            self.group.links.new(self._build_bool_socket(value, x, y), socket)
+            return
+        socket.default_value = bool(value)
+
+    def _set_string_input(self, socket, value, x: float, y: float) -> None:
+        if _is_socket_value(value):
+            self.group.links.new(value, socket)
+            return
+        if contains_dynamic(value):
+            self.group.links.new(self._build_string_socket(value, x, y), socket)
+            return
+        socket.default_value = str(value)
+
+    def _set_vector_input(self, socket, value, x: float, y: float) -> None:
+        components = list(value) if isinstance(value, (list, tuple, Vector, Euler)) else [value, value, value]
+        if len(components) != 3:
+            raise BlenderConversionError("Expected a 3D vector value")
+        if any(_is_socket_value(component) or contains_dynamic(component) for component in components):
+            combine = self.group.nodes.new("ShaderNodeCombineXYZ")
+            combine.location = (x, y)
+            self._set_number_input(combine.inputs["X"], components[0], x - 180, y)
+            self._set_number_input(combine.inputs["Y"], components[1], x - 180, y - 80)
+            self._set_number_input(combine.inputs["Z"], components[2], x - 180, y - 160)
+            self.group.links.new(combine.outputs["Vector"], socket)
+            return
+        socket.default_value = tuple(float(component) for component in components)
+
+    def _build_number_socket(self, value, x: float, y: float):
+        if _is_socket_value(value):
+            return value
+        if is_dynamic(value):
+            if value.operation == "parameter":
+                return self.group_input.outputs[self.parameter_outputs[(value.parameter_name, value.component)]]
+            if value.operation == "unary":
+                math_node = self.group.nodes.new("ShaderNodeMath")
+                math_node.location = (x, y)
+                if value.operator == "-":
+                    math_node.operation = "MULTIPLY"
+                    self.group.links.new(self._build_number_socket(value.operand, x - 220, y), math_node.inputs[0])
+                    math_node.inputs[1].default_value = -1.0
+                elif value.operator == "ceil":
+                    math_node.operation = "CEIL"
+                    self.group.links.new(self._build_number_socket(value.operand, x - 220, y), math_node.inputs[0])
+                elif value.operator == "floor":
+                    math_node.operation = "FLOOR"
+                    self.group.links.new(self._build_number_socket(value.operand, x - 220, y), math_node.inputs[0])
+                else:
+                    raise BlenderConversionError(f"Unsupported dynamic numeric unary operator: {value.operator}")
+                return math_node.outputs["Value"]
+            if value.operation == "binary":
+                math_node = self.group.nodes.new("ShaderNodeMath")
+                math_node.operation = _math_operation(value.operator)
+                math_node.location = (x, y)
+                self._set_number_input(math_node.inputs[0], value.left, x - 220, y)
+                self._set_number_input(math_node.inputs[1], value.right, x - 220, y - 80)
+                return math_node.outputs["Value"]
+            raise BlenderConversionError(f"Unsupported dynamic numeric expression: {value.operation}")
+        return self._value_node(float(value), x, y)
+
+    def _build_bool_socket(self, value, x: float, y: float):
+        if _is_socket_value(value):
+            return value
+        if is_dynamic(value):
+            if value.operation == "parameter":
+                return self.group_input.outputs[self.parameter_outputs[(value.parameter_name, value.component)]]
+            if value.operation == "unary" and value.operator == "!":
+                node = self.group.nodes.new("FunctionNodeBooleanMath")
+                node.operation = "NOT"
+                node.location = (x, y)
+                self._set_bool_input(node.inputs[0], value.operand, x - 220, y)
+                return node.outputs["Boolean"]
+            if value.operation == "binary" and value.operator in {"&&", "||"}:
+                node = self.group.nodes.new("FunctionNodeBooleanMath")
+                node.operation = "AND" if value.operator == "&&" else "OR"
+                node.location = (x, y)
+                self._set_bool_input(node.inputs[0], value.left, x - 220, y)
+                self._set_bool_input(node.inputs[1], value.right, x - 220, y - 80)
+                return node.outputs["Boolean"]
+            if value.operation == "binary" and value.operator in {"==", "!=", "<", "<=", ">", ">="}:
+                return self._build_compare_socket(value, x, y)
+            raise BlenderConversionError(f"Unsupported dynamic boolean expression: {value.operation}")
+
+        bool_node = self.group.nodes.new("FunctionNodeBooleanMath")
+        bool_node.operation = "OR"
+        bool_node.location = (x, y)
+        bool_node.inputs[0].default_value = bool(value)
+        bool_node.inputs[1].default_value = False
+        return bool_node.outputs["Boolean"]
+
+    def _build_string_socket(self, value, x: float, y: float):
+        if _is_socket_value(value):
+            return value
+        if is_dynamic(value) and value.operation == "parameter":
+            return self.group_input.outputs[self.parameter_outputs[(value.parameter_name, value.component)]]
+        raise BlenderConversionError("Dynamic string values are only supported as direct parameters")
+
+    def _build_compare_socket(self, expression: DynamicExpression, x: float, y: float):
+        if _value_kind(expression.left) == "bool" or _value_kind(expression.right) == "bool":
+            node = self.group.nodes.new("FunctionNodeBooleanMath")
+            node.location = (x, y)
+            node.operation = "XNOR" if expression.operator == "==" else "XOR"
+            self._set_bool_input(node.inputs[0], expression.left, x - 220, y)
+            self._set_bool_input(node.inputs[1], expression.right, x - 220, y - 80)
+            return node.outputs["Boolean"]
+
+        compare = self.group.nodes.new("FunctionNodeCompare")
+        compare.location = (x, y)
+        if _value_kind(expression.left) == "string" or _value_kind(expression.right) == "string":
+            compare.data_type = "STRING"
+            compare.operation = _compare_operation(expression.operator)
+            self._set_string_input(compare.inputs[8], expression.left, x - 220, y)
+            self._set_string_input(compare.inputs[9], expression.right, x - 220, y - 80)
+            return compare.outputs["Result"]
+
+        compare.data_type = "FLOAT"
+        compare.operation = _compare_operation(expression.operator)
+        self._set_number_input(compare.inputs[0], expression.left, x - 220, y)
+        self._set_number_input(compare.inputs[1], expression.right, x - 220, y - 80)
+        return compare.outputs["Result"]
+
+    def _switch_number_from_bool(self, condition, false_value, true_value, x: float, y: float):
+        switch = self.group.nodes.new("GeometryNodeSwitch")
+        switch.input_type = "FLOAT"
+        switch.location = (x, y)
+        self._set_bool_input(switch.inputs["Switch"], condition, x - 180, y - 120)
+        self._set_number_input(switch.inputs["False"], false_value, x - 180, y)
+        self._set_number_input(switch.inputs["True"], true_value, x - 180, y - 80)
+        return switch.outputs["Output"]
+
+    def _value_node(self, value: float, x: float, y: float):
+        node = self.group.nodes.new("ShaderNodeValue")
+        node.location = (x, y)
+        node.outputs["Value"].default_value = value
+        return node.outputs["Value"]
+
+    def _empty_geometry(self):
+        if self._empty_geometry_socket is not None:
+            return self._empty_geometry_socket
+        points = self.group.nodes.new("GeometryNodePoints")
+        points.location = (-960, -520)
+        points.inputs["Count"].default_value = 0
+        points.inputs["Radius"].default_value = 0.001
+        self._empty_geometry_socket = points.outputs["Points"]
+        return self._empty_geometry_socket
+
+    def _dynamic_transform_components(self, node: TransformNode, x: float, y: float):
+        if node.kind == "translate":
+            translation = _value_vector3(_first_argument_value(node.params, "v"))
+            return translation, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], False
+        if node.kind == "rotate":
+            if "a" in node.params and "v" in node.params:
+                raise BlenderConversionError("Dynamic rotate(a=..., v=...) is not supported in the Blender 5.1 GN path")
+            value = _first_argument_value(node.params, "a", default=[0.0, 0.0, 0.0])
+            if isinstance(value, (int, float, DynamicExpression)):
+                rotation = [0.0, 0.0, _degrees_to_radians_value(value)]
+            else:
+                vector = _value_vector3(value)
+                rotation = [_degrees_to_radians_value(component) for component in vector]
+            return [0.0, 0.0, 0.0], rotation, [1.0, 1.0, 1.0], False
+        if node.kind == "scale":
+            scale = _value_vector3(_first_argument_value(node.params, "v", default=1.0))
+            return [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], scale, False
+        raise BlenderConversionError(f"Dynamic {node.kind}() is not supported in the Blender 5.1 GN path")
 
     def _build_profile_curve(self, points: list[tuple[float, float]], x: float, y: float):
         if len(points) < 3:
@@ -1060,7 +1492,96 @@ def _mirror_scale_vector(normal_value: tuple[float, float, float]) -> tuple[floa
     raise BlenderConversionError("mirror() in the Blender 5.1 GN path currently supports only axis-aligned normals")
 
 
-def _segment_count(radius: float, tessellation: dict) -> int:
+def _dynamic_dependencies(value) -> set[str]:
+    if _is_socket_value(value):
+        return set()
+    if is_dynamic(value):
+        return set(value.dependencies)
+    if isinstance(value, (list, tuple)):
+        dependencies: set[str] = set()
+        for item in value:
+            dependencies.update(_dynamic_dependencies(item))
+        return dependencies
+    if isinstance(value, dict):
+        dependencies: set[str] = set()
+        for item in value.values():
+            dependencies.update(_dynamic_dependencies(item))
+        return dependencies
+    return set()
+
+
+def _is_socket_value(value) -> bool:
+    return hasattr(value, "node") and hasattr(value, "links") and hasattr(value, "is_output")
+
+
+def _value_kind(value) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)) or is_dynamic(value):
+        if is_dynamic(value):
+            return value.kind
+        return "number"
+    raise BlenderConversionError(f"Unsupported dynamic value type: {type(value).__name__}")
+
+
+def _math_operation(operator: str) -> str:
+    mapping = {
+        "+": "ADD",
+        "-": "SUBTRACT",
+        "*": "MULTIPLY",
+        "/": "DIVIDE",
+        "%": "FLOORED_MODULO",
+        "max": "MAXIMUM",
+    }
+    if operator not in mapping:
+        raise BlenderConversionError(f"Unsupported math operator: {operator}")
+    return mapping[operator]
+
+
+def _compare_operation(operator: str) -> str:
+    mapping = {
+        "==": "EQUAL",
+        "!=": "NOT_EQUAL",
+        "<": "LESS_THAN",
+        "<=": "LESS_EQUAL",
+        ">": "GREATER_THAN",
+        ">=": "GREATER_EQUAL",
+    }
+    if operator not in mapping:
+        raise BlenderConversionError(f"Unsupported compare operator: {operator}")
+    return mapping[operator]
+
+
+def _transform_supports_dynamic(node: TransformNode) -> bool:
+    if not contains_dynamic(node.params):
+        return False
+    if node.kind in {"translate", "scale"}:
+        return True
+    if node.kind == "rotate" and not ("a" in node.params and "v" in node.params):
+        return True
+    return False
+
+
+def _segment_count(radius, tessellation: dict):
+    if contains_dynamic(radius) or contains_dynamic(tessellation):
+        fn = tessellation.get("fn", 0)
+        fa = tessellation.get("fa", 12.0)
+        fs = tessellation.get("fs", 2.0)
+        if contains_dynamic(fn):
+            return _max_number_value(fn, 8)
+        if int(fn or 0) >= 3:
+            return int(fn)
+        segments_by_angle = (
+            math.ceil(360.0 / max(float(fa), 1e-6))
+            if not contains_dynamic(fa)
+            else _ceil_number(_divide_number(360.0, _max_number_value(fa, 1e-6)))
+        )
+        circumference = _multiply_number(_multiply_number(2.0, math.pi), radius)
+        segments_by_size = _ceil_number(_divide_number(circumference, _max_number_value(fs, 1e-6)))
+        return _max_number_value(_max_number_value(8, segments_by_angle), segments_by_size)
+
     fn = int(tessellation.get("fn", 0) or 0)
     if fn >= 3:
         return fn
@@ -1072,11 +1593,17 @@ def _segment_count(radius: float, tessellation: dict) -> int:
     return max(8, segments_by_angle, segments_by_size)
 
 
-def _sphere_segment_count(radius: float, tessellation: dict) -> int:
+def _sphere_segment_count(radius, tessellation: dict):
+    if contains_dynamic(radius) or contains_dynamic(tessellation):
+        return _segment_count(radius, tessellation)
     fn = int(tessellation.get("fn", 0) or 0)
     if fn >= 8:
         return fn
     return _segment_count(radius, tessellation)
+
+
+def _sphere_ring_count_value(segments):
+    return _max_number_value(_floor_number(_divide_number(segments, 2.0)), 4)
 
 
 def _resolve_sphere_radius(params: dict) -> float:
@@ -1112,6 +1639,137 @@ def _first_argument(params: dict, preferred_name: str, *, default=None):
     if default is not None:
         return default
     raise BlenderConversionError(f"Missing required argument: {preferred_name}")
+
+
+def _first_argument_value(params: dict, preferred_name: str, *, default=None):
+    if preferred_name in params:
+        return params[preferred_name]
+    positional = params.get("_positional", [])
+    if positional:
+        return positional[0]
+    if default is not None:
+        return default
+    raise BlenderConversionError(f"Missing required argument: {preferred_name}")
+
+
+def _height_value(params: dict):
+    return params.get("h", params.get("height", params.get("_positional", [1.0])[0] if params.get("_positional") else 1.0))
+
+
+def _resolve_sphere_radius_value(params: dict):
+    positional = params.get("_positional", [])
+    radius = params.get("r")
+    if radius is None and "d" in params:
+        radius = _divide_number(params["d"], 2.0)
+    if radius is None and positional:
+        radius = positional[0]
+    if radius is None:
+        radius = 1.0
+    return radius
+
+
+def _resolve_radius_value(params: dict, radius_key: str, diameter_key: str, alt_radius_key: str, alt_diameter_key: str, *, fallback):
+    if radius_key in params:
+        return params[radius_key]
+    if diameter_key in params:
+        return _divide_number(params[diameter_key], 2.0)
+    if alt_radius_key in params:
+        return params[alt_radius_key]
+    if alt_diameter_key in params:
+        return _divide_number(params[alt_diameter_key], 2.0)
+    return fallback
+
+
+def _binary_number_value(operator: str, left, right):
+    if contains_dynamic(left) or contains_dynamic(right):
+        return DynamicExpression(
+            kind="number",
+            operation="binary",
+            operator=operator,
+            left=left,
+            right=right,
+            dependencies=frozenset(_dynamic_dependencies(left) | _dynamic_dependencies(right)),
+        )
+    if operator == "+":
+        return float(left) + float(right)
+    if operator == "-":
+        return float(left) - float(right)
+    if operator == "*":
+        return float(left) * float(right)
+    if operator == "/":
+        return float(left) / float(right)
+    if operator == "%":
+        return float(left) % float(right)
+    raise BlenderConversionError(f"Unsupported numeric operator: {operator}")
+
+
+def _max_number_value(left, right):
+    if contains_dynamic(left) or contains_dynamic(right):
+        return DynamicExpression(
+            kind="number",
+            operation="binary",
+            operator="max",
+            left=left,
+            right=right,
+            dependencies=frozenset(_dynamic_dependencies(left) | _dynamic_dependencies(right)),
+        )
+    return max(float(left), float(right))
+
+
+def _divide_number(left, right):
+    return _binary_number_value("/", left, right)
+
+
+def _multiply_number(left, right):
+    return _binary_number_value("*", left, right)
+
+
+def _ceil_number(value):
+    if contains_dynamic(value):
+        return DynamicExpression(
+            kind="number",
+            operation="unary",
+            operator="ceil",
+            operand=value,
+            dependencies=frozenset(_dynamic_dependencies(value)),
+        )
+    return math.ceil(float(value))
+
+
+def _floor_number(value):
+    if contains_dynamic(value):
+        return DynamicExpression(
+            kind="number",
+            operation="unary",
+            operator="floor",
+            operand=value,
+            dependencies=frozenset(_dynamic_dependencies(value)),
+        )
+    return math.floor(float(value))
+
+
+def _degrees_to_radians_value(value):
+    return _multiply_number(value, math.pi / 180.0)
+
+
+def _value_vector2(value) -> tuple[object, object]:
+    if isinstance(value, (int, float)) or is_dynamic(value):
+        return value, value
+    if len(value) == 3:
+        return value[0], value[1]
+    if len(value) != 2:
+        raise BlenderConversionError("Expected a 2D vector")
+    return value[0], value[1]
+
+
+def _value_vector3(value) -> tuple[object, object, object]:
+    if isinstance(value, (int, float)) or is_dynamic(value):
+        return value, value, value
+    if len(value) == 2:
+        return value[0], value[1], 1.0
+    if len(value) != 3:
+        raise BlenderConversionError("Expected a 3D vector")
+    return value[0], value[1], value[2]
 
 
 def _vector2(value) -> tuple[float, float]:
@@ -1165,6 +1823,18 @@ def _resolve_profile_rotation(params: dict) -> float:
         return float(value)
     vector = _vector3(value)
     return float(vector[2])
+
+
+def _profile_rotation_value(params: dict):
+    if "a" in params and "v" in params:
+        if contains_dynamic(params):
+            raise BlenderConversionError("Dynamic 2D rotate(a=..., v=...) only supports literal Z-axis rotations")
+        return _resolve_profile_rotation(params)
+    value = _first_argument_value(params, "a", default=0.0)
+    if isinstance(value, (int, float)) or is_dynamic(value):
+        return value
+    vector = _value_vector3(value)
+    return vector[2]
 
 
 def _mirror_matrix(normal_value: tuple[float, float, float]) -> Matrix:

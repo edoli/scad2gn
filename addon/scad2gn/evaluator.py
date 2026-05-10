@@ -6,8 +6,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import ast_nodes
+from .dynamic_values import (
+    DynamicExpression,
+    UnsupportedDynamicParametersError,
+    collect_dynamic_dependencies,
+    contains_dynamic,
+    dynamic_parameter,
+    is_dynamic,
+)
 from .errors import EvaluationError, SourceLocation, UnsupportedFeatureError
-from .ir import BooleanNode, ExtrudeNode, IRNode, PrimitiveNode, TransformNode
+from .ir import BooleanNode, ConditionalNode, ExtrudeNode, IRNode, PrimitiveNode, TransformNode
 
 TRANSFORM_BUILTINS = {"translate", "rotate", "scale", "resize", "mirror", "multmatrix"}
 BOOLEAN_BUILTINS = {"union", "difference", "intersection"}
@@ -19,9 +27,9 @@ UNSUPPORTED_BUILTINS = {"hull", "minkowski", "offset", "projection", "surface", 
 
 @dataclass(slots=True)
 class RangeValue:
-    start: float
-    end: float
-    step: float
+    start: Any
+    end: Any
+    step: Any
 
     def expand(self) -> list[float]:
         values: list[float] = []
@@ -98,6 +106,63 @@ class Evaluator:
                 environment.define_module(statement)
         return defaults
 
+    def evaluate_parameterized(self, program: ast_nodes.Program, customizer_parameters: list[Any]) -> tuple[IRNode | None, list[Any]]:
+        customizer_by_name = {parameter.name: parameter for parameter in customizer_parameters}
+        parameter_values = {
+            parameter.name: self.parameters.get(parameter.name, parameter.default)
+            for parameter in customizer_parameters
+        }
+        dynamic_names = set(parameter_values)
+
+        while True:
+            environment = self._build_parameterized_environment(customizer_parameters, parameter_values, dynamic_names)
+            try:
+                nodes = self._evaluate_statements(program.statements, environment)
+                ir = _combine_nodes(nodes)
+                unsupported_dynamic = _collect_unsupported_dynamic_dependencies(ir)
+                if unsupported_dynamic:
+                    raise UnsupportedDynamicParametersError(unsupported_dynamic)
+                used_dynamic = _collect_ir_dynamic_dependencies(ir)
+                active_parameters = []
+                for name in [parameter.name for parameter in customizer_parameters]:
+                    if name not in dynamic_names or name not in used_dynamic:
+                        continue
+                    parameter = customizer_by_name[name]
+                    _apply_parameter_override(parameter, parameter_values[name])
+                    active_parameters.append(parameter)
+                return ir, active_parameters
+            except UnsupportedDynamicParametersError as error:
+                removable = error.parameter_names & dynamic_names
+                if not removable:
+                    raise
+                dynamic_names -= removable
+
+    def _build_parameterized_environment(
+        self,
+        customizer_parameters: list[Any],
+        parameter_values: dict[str, Any],
+        dynamic_names: set[str],
+    ) -> Environment:
+        environment = Environment()
+        environment.variables.update({"$fn": 0, "$fa": 12, "$fs": 2})
+
+        non_customizer_overrides = {
+            key: value
+            for key, value in self.parameters.items()
+            if key not in parameter_values
+        }
+        environment.locked_names.update(non_customizer_overrides)
+        environment.variables.update(non_customizer_overrides)
+
+        for parameter in customizer_parameters:
+            environment.locked_names.add(parameter.name)
+            value = parameter_values[parameter.name]
+            if parameter.name in dynamic_names:
+                environment.variables[parameter.name] = _dynamic_parameter_value(parameter)
+            else:
+                environment.variables[parameter.name] = value
+        return environment
+
     def _evaluate_statements(self, statements: list[ast_nodes.Statement], environment: Environment) -> list[IRNode]:
         nodes: list[IRNode] = []
         for statement in statements:
@@ -118,7 +183,21 @@ class Evaluator:
             return self._evaluate_statements(statement.statements, block_environment)
 
         if isinstance(statement, ast_nodes.IfStatement):
-            branch = statement.then_branch if _truthy(self._eval_expression(statement.condition, environment)) else statement.else_branch
+            condition = self._eval_expression(statement.condition, environment)
+            if is_dynamic(condition):
+                then_nodes = self._evaluate_statement(statement.then_branch, environment.child())
+                else_nodes = []
+                if statement.else_branch is not None:
+                    else_nodes = self._evaluate_statement(statement.else_branch, environment.child())
+                return [
+                    ConditionalNode(
+                        location=statement.location,
+                        condition=condition,
+                        then_branch=_combine_nodes(then_nodes),
+                        else_branch=_combine_nodes(else_nodes),
+                    )
+                ]
+            branch = statement.then_branch if _truthy(condition) else statement.else_branch
             if branch is None:
                 return []
             return self._evaluate_statement(branch, environment.child())
@@ -321,7 +400,7 @@ class Evaluator:
             start = _coerce_number(self._eval_expression(expression.start, environment), expression.location, self.path)
             end = _coerce_number(self._eval_expression(expression.end, environment), expression.location, self.path)
             if expression.step is None:
-                step = 1.0 if end >= start else -1.0
+                step = 1.0 if contains_dynamic(start) or contains_dynamic(end) or end >= start else -1.0
             else:
                 step = _coerce_number(self._eval_expression(expression.step, environment), expression.location, self.path)
             if math.isclose(step, 0.0):
@@ -356,7 +435,15 @@ def _combine_nodes(nodes: list[IRNode]) -> IRNode | None:
 
 
 def _expand_iterable(value: Any, *, location: SourceLocation, path: str | None) -> list[Any]:
+    if contains_dynamic(value):
+        raise UnsupportedDynamicParametersError(collect_dynamic_dependencies(value))
     if isinstance(value, RangeValue):
+        if contains_dynamic(value.start) or contains_dynamic(value.end) or contains_dynamic(value.step):
+            raise UnsupportedDynamicParametersError(
+                collect_dynamic_dependencies(value.start)
+                | collect_dynamic_dependencies(value.end)
+                | collect_dynamic_dependencies(value.step)
+            )
         return value.expand()
     if isinstance(value, list):
         return list(value)
@@ -367,7 +454,11 @@ def _truthy(value: Any) -> bool:
     return bool(value)
 
 
-def _coerce_number(value: Any, location: SourceLocation, path: str | None) -> float:
+def _coerce_number(value: Any, location: SourceLocation, path: str | None) -> float | DynamicExpression:
+    if is_dynamic(value):
+        if value.kind != "number":
+            raise EvaluationError("Expected a numeric value", path=path, location=location)
+        return value
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise EvaluationError("Expected a numeric value", path=path, location=location)
     return float(value)
@@ -380,6 +471,8 @@ def _apply_unary(
     location: SourceLocation,
     path: str | None,
 ) -> Any:
+    if contains_dynamic(operand):
+        return _apply_dynamic_unary(operator, operand, location=location, path=path)
     if operator == "+":
         return operand
     if operator == "-":
@@ -401,6 +494,8 @@ def _apply_binary(
 ) -> Any:
     if operator in {"+", "-", "*", "/", "%"}:
         return _apply_arithmetic(operator, left, right, location=location, path=path)
+    if contains_dynamic(left) or contains_dynamic(right):
+        return _apply_dynamic_logic_or_compare(operator, left, right, location=location, path=path)
     if operator == "&&":
         return _truthy(left) and _truthy(right)
     if operator == "||":
@@ -428,6 +523,8 @@ def _apply_arithmetic(
     location: SourceLocation,
     path: str | None,
 ) -> Any:
+    if contains_dynamic(left) or contains_dynamic(right):
+        return _apply_dynamic_arithmetic(operator, left, right, location=location, path=path)
     if isinstance(left, list) or isinstance(right, list):
         return _apply_vector_arithmetic(operator, left, right, location=location, path=path)
 
@@ -482,3 +579,204 @@ def _apply_scalar_arithmetic(operator: str, left: float, right: float) -> float:
     if operator == "%":
         return left % right
     raise ValueError(operator)
+
+
+def _dynamic_parameter_value(parameter: Any) -> Any:
+    if parameter.kind in {"int", "float"}:
+        return dynamic_parameter(parameter.name, "number")
+    if parameter.kind == "bool":
+        return dynamic_parameter(parameter.name, "bool")
+    if parameter.kind == "string":
+        return dynamic_parameter(parameter.name, "string")
+    if parameter.kind == "vector":
+        return [
+            dynamic_parameter(parameter.name, "number", component=index)
+            for index, _component_kind in enumerate(parameter.component_kinds)
+        ]
+    raise EvaluationError(f"Unsupported customizer parameter type: {parameter.kind}", path=None, location=None)
+
+
+def _apply_dynamic_unary(
+    operator: str,
+    operand: Any,
+    *,
+    location: SourceLocation,
+    path: str | None,
+) -> Any:
+    if operator == "+":
+        return operand
+    if operator == "-":
+        if isinstance(operand, list):
+            return [_apply_dynamic_unary(operator, item, location=location, path=path) for item in operand]
+        numeric_operand = _coerce_number(operand, location, path)
+        return DynamicExpression(
+            kind="number",
+            operation="unary",
+            operator=operator,
+            operand=numeric_operand,
+            dependencies=frozenset(collect_dynamic_dependencies(numeric_operand)),
+        )
+    if operator == "!":
+        if isinstance(operand, list):
+            raise EvaluationError("Logical negation does not support vectors", path=path, location=location)
+        return DynamicExpression(
+            kind="bool",
+            operation="unary",
+            operator=operator,
+            operand=operand,
+            dependencies=frozenset(collect_dynamic_dependencies(operand)),
+        )
+    raise EvaluationError(f"Unsupported unary operator: {operator}", path=path, location=location)
+
+
+def _apply_dynamic_arithmetic(
+    operator: str,
+    left: Any,
+    right: Any,
+    *,
+    location: SourceLocation,
+    path: str | None,
+) -> Any:
+    if isinstance(left, list) and isinstance(right, list):
+        if len(left) != len(right):
+            raise EvaluationError("Vector lengths must match", path=path, location=location)
+        return [
+            _dynamic_numeric_expression(operator, left_value, right_value, location=location, path=path)
+            for left_value, right_value in zip(left, right)
+        ]
+
+    if isinstance(left, list):
+        scalar = _coerce_number(right, location, path)
+        return [
+            _dynamic_numeric_expression(operator, value, scalar, location=location, path=path)
+            for value in left
+        ]
+
+    if isinstance(right, list):
+        scalar = _coerce_number(left, location, path)
+        return [
+            _dynamic_numeric_expression(operator, scalar, value, location=location, path=path)
+            for value in right
+        ]
+
+    return _dynamic_numeric_expression(operator, left, right, location=location, path=path)
+
+
+def _dynamic_numeric_expression(
+    operator: str,
+    left: Any,
+    right: Any,
+    *,
+    location: SourceLocation,
+    path: str | None,
+) -> Any:
+    left_number = _coerce_number(left, location, path)
+    right_number = _coerce_number(right, location, path)
+    if not contains_dynamic(left_number) and not contains_dynamic(right_number):
+        return _apply_scalar_arithmetic(operator, float(left_number), float(right_number))
+    return DynamicExpression(
+        kind="number",
+        operation="binary",
+        operator=operator,
+        left=left_number,
+        right=right_number,
+        dependencies=frozenset(
+            collect_dynamic_dependencies(left_number) | collect_dynamic_dependencies(right_number)
+        ),
+    )
+
+
+def _apply_dynamic_logic_or_compare(
+    operator: str,
+    left: Any,
+    right: Any,
+    *,
+    location: SourceLocation,
+    path: str | None,
+) -> DynamicExpression:
+    if isinstance(left, list) or isinstance(right, list):
+        raise EvaluationError("Dynamic vector comparisons are not supported", path=path, location=location)
+    if operator not in {"&&", "||", "==", "!=", "<", "<=", ">", ">="}:
+        raise EvaluationError(f"Unsupported operator: {operator}", path=path, location=location)
+    return DynamicExpression(
+        kind="bool",
+        operation="binary",
+        operator=operator,
+        left=left,
+        right=right,
+        dependencies=frozenset(collect_dynamic_dependencies(left) | collect_dynamic_dependencies(right)),
+    )
+
+
+def _collect_ir_dynamic_dependencies(node: IRNode | None) -> set[str]:
+    if node is None:
+        return set()
+    if isinstance(node, PrimitiveNode):
+        return collect_dynamic_dependencies(node.params)
+    if isinstance(node, TransformNode):
+        return collect_dynamic_dependencies(node.params) | _collect_ir_dynamic_dependencies(node.child)
+    if isinstance(node, ExtrudeNode):
+        return collect_dynamic_dependencies(node.params) | _collect_ir_dynamic_dependencies(node.child)
+    if isinstance(node, BooleanNode):
+        dependencies: set[str] = set()
+        for child in node.children:
+            dependencies.update(_collect_ir_dynamic_dependencies(child))
+        return dependencies
+    if isinstance(node, ConditionalNode):
+        return (
+            collect_dynamic_dependencies(node.condition)
+            | _collect_ir_dynamic_dependencies(node.then_branch)
+            | _collect_ir_dynamic_dependencies(node.else_branch)
+        )
+    return set()
+
+
+def _collect_unsupported_dynamic_dependencies(node: IRNode | None) -> set[str]:
+    if node is None:
+        return set()
+    if isinstance(node, PrimitiveNode):
+        if node.kind == "polygon":
+            return collect_dynamic_dependencies(node.params)
+        return set()
+    if isinstance(node, TransformNode):
+        dependencies = _collect_unsupported_dynamic_dependencies(node.child)
+        if node.kind in {"resize", "mirror", "multmatrix"}:
+            dependencies.update(collect_dynamic_dependencies(node.params))
+        if node.kind == "rotate" and "a" in node.params and "v" in node.params:
+            dependencies.update(collect_dynamic_dependencies(node.params))
+        return dependencies
+    if isinstance(node, ExtrudeNode):
+        dependencies = _collect_unsupported_dynamic_dependencies(node.child)
+        if node.kind == "rotate_extrude":
+            dependencies.update(collect_dynamic_dependencies(node.params))
+            dependencies.update(_collect_ir_dynamic_dependencies(node.child))
+        return dependencies
+    if isinstance(node, BooleanNode):
+        dependencies: set[str] = set()
+        for child in node.children:
+            dependencies.update(_collect_unsupported_dynamic_dependencies(child))
+        return dependencies
+    if isinstance(node, ConditionalNode):
+        return (
+            _collect_unsupported_dynamic_dependencies(node.then_branch)
+            | _collect_unsupported_dynamic_dependencies(node.else_branch)
+        )
+    return set()
+
+
+def _apply_parameter_override(parameter: Any, value: Any) -> None:
+    parameter.default = value
+    if parameter.kind == "int" and isinstance(value, float) and not value.is_integer():
+        parameter.kind = "float"
+        return
+    if parameter.kind != "vector" or not isinstance(value, (list, tuple)):
+        return
+
+    component_kinds = list(parameter.component_kinds)
+    for index, component in enumerate(value):
+        if index >= len(component_kinds):
+            component_kinds.append("float" if isinstance(component, float) and not component.is_integer() else "int")
+            continue
+        if isinstance(component, float) and not component.is_integer():
+            component_kinds[index] = "float"
+    parameter.component_kinds = component_kinds
