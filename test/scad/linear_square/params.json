@@ -1,0 +1,8 @@
+{
+  "parameters": {
+    "width": [6, 8],
+    "depth": [4],
+    "height": [3],
+    "centered": [true]
+  }
+}

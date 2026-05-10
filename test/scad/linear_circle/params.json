@@ -1,0 +1,14 @@
+{
+  "combinations": [
+    {
+      "radius": 3,
+      "height": 5,
+      "detail": 40
+    },
+    {
+      "radius": 2,
+      "height": 7,
+      "detail": 24
+    }
+  ]
+}

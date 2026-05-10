@@ -1,0 +1,12 @@
+{
+  "combinations": [
+    {
+      "size": [10, 8, 6],
+      "centered": false
+    },
+    {
+      "size": [4, 4, 4],
+      "centered": true
+    }
+  ]
+}

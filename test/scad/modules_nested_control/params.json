@@ -1,0 +1,16 @@
+{
+  "combinations": [
+    {
+      "count": 3,
+      "enabled": true,
+      "mode": "rack",
+      "step": 3.0
+    },
+    {
+      "count": 2,
+      "enabled": false,
+      "mode": "rack",
+      "step": 2.5
+    }
+  ]
+}

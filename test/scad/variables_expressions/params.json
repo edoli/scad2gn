@@ -1,0 +1,14 @@
+{
+  "combinations": [
+    {
+      "base": 6,
+      "centered": true,
+      "label": "box"
+    },
+    {
+      "base": 4,
+      "centered": false,
+      "label": "crate"
+    }
+  ]
+}
