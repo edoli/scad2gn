@@ -44,12 +44,6 @@ When changing behavior:
 
 ## Useful Commands
 
-Run Python/unit tests:
-
-```bash
-python test/test_scad2gn.py
-```
-
 Resolve Blender path from `.local/blender_path.txt`. If it is missing or invalid, discover Blender 5.1 and save it there.
 
 Run full validation:
