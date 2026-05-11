@@ -10,14 +10,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from addon.scad2gn.params import (  # noqa: E402
+from scripts.validation_cases import (  # noqa: E402
     discover_case_directories,
     generate_parameter_combinations,
     load_case_manifest,
     parameter_slug,
     serialize_scad_value,
 )
-from addon.scad2gn.stl import compare_stl_meshes  # noqa: E402
+from scripts.validation_stl import compare_stl_meshes  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

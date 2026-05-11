@@ -13,10 +13,10 @@ if str(REPO_ROOT) not in sys.path:
 from addon.scad2gn.customizer import collect_customizer_parameters_from_source
 from addon.scad2gn.errors import UnsupportedFeatureError
 from addon.scad2gn.ir import ConditionalNode, PrimitiveNode
-from addon.scad2gn.params import discover_case_directories, generate_parameter_combinations, load_case_manifest
 from addon.scad2gn.runtime import collect_top_level_defaults, load_ir_from_file, parse_source
 from addon.scad2gn.evaluator import Evaluator
-from addon.scad2gn.stl import compare_stl_meshes
+from scripts.validation_cases import discover_case_directories, generate_parameter_combinations, load_case_manifest
+from scripts.validation_stl import compare_stl_meshes
 
 
 class Scad2GnCoreTests(unittest.TestCase):

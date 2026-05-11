@@ -23,13 +23,14 @@ addon/
     evaluator.py          AST to IR evaluation
     ir.py                 Intermediate representation
     blender_bridge.py     IR to Blender Geometry Nodes
-    stl.py                STL loading and comparison
 
 scripts/
   generate_openscad_stl.py
   export_blender_stl.py
   compare_stl.py
   validate_all.py
+  validation_cases.py     Validation fixture discovery and parameter combinations
+  validation_stl.py       STL loading and validation mesh comparison
 
 test/
   scad/                   Validation fixture inputs
