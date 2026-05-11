@@ -210,15 +210,6 @@ Sample points on both meshes and measure bidirectional distances.
 
 The comparison should pass only if the maximum or percentile distance is below a defined tolerance.
 
-Recommended default tolerance:
-
-```text
-absolute_distance_tolerance = 1e-4
-relative_dimension_tolerance = 1e-4
-volume_relative_tolerance = 1e-3
-surface_area_relative_tolerance = 1e-3
-```
-
 These values may need adjustment depending on OpenSCAD tessellation settings and Blender mesh generation behavior.
 
 ### 3. Visual Debug Output
