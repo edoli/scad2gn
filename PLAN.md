@@ -19,6 +19,21 @@ These constraints define the intended architecture and should not be relaxed wit
 * Any required Blender host object must remain an implementation detail and must not store the imported OpenSCAD shape as editable mesh vertices/faces.
 * Mesh boolean operations inside Geometry Nodes must use the Manifold solver only.
 * If a requested OpenSCAD feature cannot be represented procedurally yet, the importer must fail clearly or mark the feature unsupported. It must not silently fall back to baked mesh import.
+* Test fixtures and sample models are validation inputs only. The implementation must not add conversion paths keyed to specific test cases, fixture names, or known sample files.
+* The implementation must not rely on library- or sample-specific dedicated geometry generators as its primary strategy. Examples of prohibited direction include bespoke nodes or lowering paths such as `SpurGearNode`, `RingGearNode`, `ThreadedRodNode`, `ThreadedNutNode`, or BOSL2-specific shortcuts added only to satisfy current tests.
+* A supported feature means any future user-provided `.scad` file using the same supported OpenSCAD constructs should convert through the same generic pipeline without new file-specific code.
+
+
+## AST-First Conversion Requirement
+
+The conversion pipeline must be driven from the parsed OpenSCAD AST at a low level.
+
+Required direction:
+
+* Parse the source file and preserve its structure through generic evaluation/lowering of expressions, variables, modules, functions, control flow, transforms, booleans, and other OpenSCAD language constructs.
+* Build reusable Geometry Nodes generation from those generic constructs rather than introducing fixture-shaped shortcuts.
+* Library code such as BOSL2 should work only because its OpenSCAD source is handled by the same generic AST/evaluation pipeline. It must not be supported through dedicated BOSL2-only conversion code added for the test suite.
+* Validation failures should lead to missing generic feature support being implemented or marked unsupported, not to test-targeted code paths.
 
 
 ## Validation Process
@@ -254,7 +269,7 @@ Parameters may be provided by:
 3. Default values inside the `.scad` file.
 4. Future automatic parameter extraction.
 
-The first implementation may rely on `params.json`.
+`params.json` is acceptable as validation metadata for choosing regression combinations, but runtime import behavior must not depend on test metadata. The importer must derive editable parameters from the `.scad` source itself.
 
 Parameter combinations should be generated consistently.
 
@@ -291,6 +306,7 @@ Goals:
 * Detect top-level OpenSCAD variables that are safe to expose as user-editable parameters.
 * Preserve default values from the `.scad` file.
 * Parse OpenSCAD Customizer-style comments where practical, including labels, descriptions, ranges, steps, option lists, and grouping.
+* Show exposed parameters on the imported object's Blender-side modifier controls so they are directly editable after import.
 * Create Blender UI controls for exposed parameters using appropriate control types:
   * numeric inputs and sliders for numbers and ranges
   * checkboxes for booleans
@@ -298,14 +314,15 @@ Goals:
   * vector controls for vector values
   * text inputs for strings where supported
 * Keep the Blender UI synchronized with the generated Geometry Nodes group inputs.
-* Support updating the object by changing Blender-side parameter values
+* Support updating the object by changing Blender-side parameter values.
+* Do not hard-code parameter lists for known sample files; extract them from the source file and Customizer metadata.
 
 Geometry Nodes parameter rules:
 
 * Exposable top-level SCAD variables should become Geometry Nodes group input sockets when their values influence supported procedural geometry.
 * Primitive and transform node inputs should use socket links instead of hard-coded constants where the value depends on an exposed parameter.
 * Expression-derived values should remain linked to parameter sockets where practical, using Geometry Nodes math/vector nodes instead of baking the evaluated result.
-* If an expression cannot yet be represented procedurally in Geometry Nodes, document the limitation and either rebuild the node tree on parameter change or mark that parameter as non-live.
+* If an expression cannot yet be represented procedurally in Geometry Nodes, document the limitation and either rebuild the node tree on parameter change through the same generic AST-driven pipeline or mark that parameter as non-live.
 
 The long-term user experience should be:
 
@@ -392,6 +409,8 @@ Do not silently ignore unsupported OpenSCAD constructs.
 The converter should preserve procedural structure whenever possible.
 
 Must use Geometry Nodes representations instead of baking source geometry to mesh.
+
+Tests are only evidence of correctness. They must never define the architecture or justify adding conversion code that only works for the current `test/scad/` samples.
 
 For example:
 
