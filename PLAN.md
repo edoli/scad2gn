@@ -204,11 +204,22 @@ Compare:
 
 This catches obvious failures quickly.
 
-### 2. Geometry Distance Comparison
+### 2. Geometry Distance and Normal Comparison
 
 Sample points on both meshes and measure bidirectional distances.
 
 The comparison should pass only if the maximum or percentile distance is below a defined tolerance.
+
+Recommended default tolerance:
+
+```text
+DEFAULT_FAILURE_ABSOLUTE_DISTANCE_TOLERANCE = 0.1
+DEFAULT_FAILURE_RELATIVE_TOLERANCE = 0.01
+DEFAULT_WARNING_ABSOLUTE_DISTANCE_TOLERANCE = 0.01
+DEFAULT_WARNING_RELATIVE_TOLERANCE = 0.001
+DEFAULT_FAILURE_ORIENTATION_MISMATCH_RATIO_TOLERANCE = 0.0
+DEFAULT_WARNING_ORIENTATION_MISMATCH_RATIO_TOLERANCE = 0.0
+```
 
 These values may need adjustment depending on OpenSCAD tessellation settings and Blender mesh generation behavior.
 
