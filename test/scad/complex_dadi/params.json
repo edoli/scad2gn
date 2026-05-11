@@ -1,0 +1,19 @@
+{
+  "combinations": [
+    {
+      "M_Size": 8,
+      "Altezza_Dado": 6.5,
+      "Slop": 0.4
+    },
+    {
+      "M_Size": 6,
+      "Altezza_Dado": 5.0,
+      "Slop": 0.2
+    },
+    {
+      "M_Size": 12,
+      "Altezza_Dado": 10.0,
+      "Slop": 0.3
+    }
+  ]
+}

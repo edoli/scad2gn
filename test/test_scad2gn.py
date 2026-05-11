@@ -4,6 +4,11 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from addon.scad2gn.customizer import collect_customizer_parameters_from_source
 from addon.scad2gn.errors import UnsupportedFeatureError
@@ -12,8 +17,6 @@ from addon.scad2gn.params import discover_case_directories, generate_parameter_c
 from addon.scad2gn.runtime import collect_top_level_defaults, load_ir_from_file, parse_source
 from addon.scad2gn.evaluator import Evaluator
 from addon.scad2gn.stl import compare_stl_meshes
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class Scad2GnCoreTests(unittest.TestCase):
@@ -117,12 +120,31 @@ class Scad2GnCoreTests(unittest.TestCase):
         self.assertGreater(len(cases), 0)
         for case_directory in cases:
             manifest = load_case_manifest(case_directory)
-            defaults = collect_top_level_defaults(case_directory / "model.scad")
-            self.assertIsInstance(defaults, dict)
+            with self.subTest(case=str(case_directory.name), phase="defaults"):
+                defaults = collect_top_level_defaults(case_directory / "model.scad")
+                self.assertIsInstance(defaults, dict)
             for combination in generate_parameter_combinations(manifest):
                 with self.subTest(case=str(case_directory.name), parameters=combination):
                     ir = load_ir_from_file(case_directory / "model.scad", combination)
                     self.assertIsNotNone(ir)
+
+    def test_complex_fixture_manifests_define_multiple_combinations(self):
+        expected_cases = {
+            "complex_bullone",
+            "complex_dadi",
+            "complex_gear_generator",
+            "complex_matice",
+            "complex_thread_generator",
+        }
+        cases = {
+            case_directory.name: case_directory
+            for case_directory in discover_case_directories(REPO_ROOT / "test" / "scad")
+            if case_directory.name.startswith("complex_")
+        }
+        self.assertTrue(expected_cases.issubset(cases))
+        for case_name in sorted(expected_cases):
+            manifest = load_case_manifest(cases[case_name])
+            self.assertGreaterEqual(len(generate_parameter_combinations(manifest)), 3)
 
     def test_unsupported_feature_raises_explicit_error(self):
         source = "minkowski() { cube(1); sphere(1); }"

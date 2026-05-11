@@ -1,0 +1,31 @@
+{
+  "combinations": [
+    {
+      "Thread": "triangular",
+      "Diameter": 12,
+      "Pitch": 1.5,
+      "Display": "all",
+      "Nut_Shape": "hex",
+      "Resolution": 2
+    },
+    {
+      "Thread": "trapezoidal",
+      "Diameter": 16,
+      "Pitch": 3,
+      "Starts": 2,
+      "Display": "rod",
+      "Rod_Length": 40,
+      "Resolution": 2
+    },
+    {
+      "Thread": "acme",
+      "Diameter": 10,
+      "Pitch": 2,
+      "Display": "nut",
+      "Nut_Shape": "square",
+      "Nut_Thickness": 10,
+      "Nut_Clearance": 0.18,
+      "Resolution": 2
+    }
+  ]
+}

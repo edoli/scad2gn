@@ -1,0 +1,28 @@
+{
+  "combinations": [
+    {
+      "Metric_Size": 8,
+      "Hardware_Type": 1,
+      "Render_Mode": 1,
+      "Thread_Protrusion": 5.0,
+      "Wall_Thickness": 2.0
+    },
+    {
+      "Metric_Size": 6,
+      "Hardware_Type": 1,
+      "Render_Mode": 3,
+      "Knob_Diameter": 30,
+      "Star_Arms": 5,
+      "Neck_Length": 6.0
+    },
+    {
+      "Metric_Size": 6,
+      "Hardware_Type": 4,
+      "Render_Mode": 4,
+      "Add_Grub_Screw": true,
+      "Grub_Screw_Size": 3,
+      "Knob_Diameter": 32,
+      "Neck_Length": 0.0
+    }
+  ]
+}

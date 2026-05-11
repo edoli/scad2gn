@@ -1,0 +1,32 @@
+{
+  "combinations": [
+    {
+      "Gear": "spur",
+      "Mode": "circ_pitch",
+      "Size": 5,
+      "Teeth": 20,
+      "Thickness": 6,
+      "Resolution": 2
+    },
+    {
+      "Gear": "ring",
+      "Mode": "mod",
+      "Size": 2,
+      "Teeth": 32,
+      "Thickness": 8,
+      "Ring_Pressure_Angle": 20,
+      "Ring_Backing": 4,
+      "Resolution": 2
+    },
+    {
+      "Gear": "rack",
+      "Mode": "mod",
+      "Size": 1.5,
+      "Teeth": 18,
+      "Thickness": 10,
+      "Rack_Backing": 3,
+      "Rack_Pressure_Angle": 20,
+      "Resolution": 2
+    }
+  ]
+}

@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    test_root = Path(args.test_root)
+    test_root = Path(args.test_root).resolve()
     output_root = Path(args.output_root)
     case_paths = [Path(args.case)] if args.case else discover_case_directories(test_root)
 

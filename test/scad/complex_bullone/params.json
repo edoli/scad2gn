@@ -1,0 +1,22 @@
+{
+  "combinations": [
+    {
+      "M_Size": 8,
+      "Lunghezza_Vite": 20,
+      "Spessore_Testa": 5.5,
+      "Slop_Bullone": 0.2
+    },
+    {
+      "M_Size": 6,
+      "Lunghezza_Vite": 16,
+      "Spessore_Testa": 4.5,
+      "Slop_Bullone": 0.15
+    },
+    {
+      "M_Size": 12,
+      "Lunghezza_Vite": 30,
+      "Spessore_Testa": 8.0,
+      "Slop_Bullone": 0.25
+    }
+  ]
+}
