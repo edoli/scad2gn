@@ -14,15 +14,8 @@ Core constraints:
 ## Structure
 
 ```text
-addon/
-  __init__.py              Blender add-on registration
-  operators.py            Import, rebuild, and export operators
-  ui.py                   Sidebar UI
-  scad2gn/
-    parser.py             OpenSCAD parser
-    evaluator.py          AST to IR evaluation
-    ir.py                 Intermediate representation
-    blender_bridge.py     IR to Blender Geometry Nodes
+addon/ 
+
 
 scripts/
   generate_openscad_stl.py
