@@ -629,24 +629,6 @@ General rules:
 * Make command-line scripts usable independently.
 * Keep generated files out of source control unless they are intentional fixtures.
 
-Recommended internal architecture:
-
-```text
-addon/
-  parser/
-    ...
-  ir/
-    ...
-  geometry_nodes/
-    ...
-  operators/
-    ...
-  ui/
-    ...
-  validation/
-    ...
-```
-
 The converter should ideally use an intermediate representation between OpenSCAD parsing and Blender node generation.
 
 Example flow:
