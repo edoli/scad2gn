@@ -38,7 +38,7 @@ When changing behavior:
 
 1. Read the relevant parser/evaluator/Geometry Nodes code before editing.
 2. Add or update a focused `.scad` fixture under `test/scad/` when needed.
-3. Keep OpenSCAD parsing, IR evaluation, Geometry Nodes generation, and validation concerns separate.
+3. Keep OpenSCAD parsing, Geometry Nodes generation, and validation concerns separate.
 4. Run validation before considering the change done.
 5. Do not rely on existing generated STL files; validation should regenerate Blender output.
 

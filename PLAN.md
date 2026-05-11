@@ -333,76 +333,6 @@ The long-term user experience should be:
 5. Export or validate the updated result.
 
 
-## Supported OpenSCAD Features
-
-Implement features incrementally.
-
-Recommended implementation order:
-
-1. Basic primitives:
-
-   * `cube`
-   * `sphere`
-   * `cylinder`
-   * `circle`
-   * `square`
-   * `polygon`
-
-2. Transformations:
-
-   * `translate`
-   * `rotate`
-   * `scale`
-   * `resize`
-   * `mirror`
-   * `multmatrix`
-
-3. Boolean operations:
-
-   * `union`
-   * `difference`
-   * `intersection`
-
-4. Extrusions:
-
-   * `linear_extrude`
-   * `rotate_extrude`
-
-5. Variables and parameters:
-
-   * numeric values
-   * booleans
-   * strings where relevant
-   * vectors
-   * simple expressions
-
-6. Modules:
-
-   * module definitions
-   * module calls
-   * nested modules
-   * parameterized modules
-
-7. Control flow:
-
-   * `for`
-   * `if`
-   * `else`
-   * list comprehensions where practical
-
-8. Advanced features:
-
-   * `hull`
-   * `minkowski`
-   * `offset`
-   * `projection`
-   * `surface`
-   * `import`
-
-Unsupported features must fail explicitly with clear error messages.
-
-Do not silently ignore unsupported OpenSCAD constructs.
-
 
 ## Conversion Design Principles
 
@@ -660,25 +590,6 @@ SCAD source
   -> Blender Geometry Nodes builder
   -> evaluated Blender object
 ```
-
-
-## Intermediate Representation
-
-Use an intermediate representation if possible.
-
-The IR should describe geometry and operations independently of Blender implementation details.
-
-Example concepts:
-
-* Primitive nodes.
-* Transform nodes.
-* Boolean operation nodes.
-* Extrusion nodes.
-* Parameter references.
-* Module instances.
-* Expression values.
-
-This makes the project easier to test without launching Blender for every parser-level change.
 
 
 ## Test Case Requirements
