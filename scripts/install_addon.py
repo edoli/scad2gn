@@ -11,7 +11,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ADDON_SOURCE = REPO_ROOT / "addon"
 ADDON_MODULE_NAME = "scad2gn"
-DEFAULT_BLENDER_VERSION = "4.2"
+DEFAULT_BLENDER_VERSION = "5.1"
 
 
 def parse_args() -> argparse.Namespace:
