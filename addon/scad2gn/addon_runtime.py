@@ -43,11 +43,13 @@ class SCAD2GN_OT_import_scad(bpy.types.Operator, ImportHelper):
 
     filename_ext = ".scad"
     filter_glob: StringProperty(default="*.scad", options={"HIDDEN"})
+
     object_name: StringProperty(
         name="Object Name",
         description="Optional override for the imported object name",
         default="",
     )
+
     parameters_json: StringProperty(
         name="Parameters JSON",
         description="Optional JSON object with SCAD parameter overrides",
@@ -58,6 +60,7 @@ class SCAD2GN_OT_import_scad(bpy.types.Operator, ImportHelper):
         from .blender_bridge import create_scad_object
 
         ensure_supported_blender_version()
+
         source_path = Path(self.filepath).resolve()
         if not source_path.exists():
             self.report({"ERROR"}, f"OpenSCAD file not found: {source_path}")
@@ -78,6 +81,20 @@ class SCAD2GN_OT_import_scad(bpy.types.Operator, ImportHelper):
         return {"FINISHED"}
 
 
+class SCAD2GN_FH_import_scad(bpy.types.FileHandler):
+    bl_idname = "SCAD2GN_FH_import_scad"
+    bl_label = "Import OpenSCAD as Geometry Nodes"
+    bl_import_operator = SCAD2GN_OT_import_scad.bl_idname
+    bl_file_extensions = ".scad"
+
+    @classmethod
+    def poll_drop(cls, context: bpy.types.Context) -> bool:
+        return (
+            context.area is not None
+            and context.area.type in {"VIEW_3D", "OUTLINER"}
+        )
+
+
 class SCAD2GN_PT_sidebar(bpy.types.Panel):
     bl_label = "SCAD2GN"
     bl_space_type = "VIEW_3D"
@@ -92,6 +109,7 @@ class SCAD2GN_PT_sidebar(bpy.types.Panel):
 
 CLASSES = (
     SCAD2GN_OT_import_scad,
+    SCAD2GN_FH_import_scad,
     SCAD2GN_PT_sidebar,
 )
 
@@ -102,12 +120,15 @@ def menu_func_import(self: bpy.types.TOPBAR_MT_file_import, _context: bpy.types.
 
 def register() -> None:
     ensure_supported_blender_version()
+
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
 
 def unregister() -> None:
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
